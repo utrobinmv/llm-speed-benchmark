@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-speed-benchmark"
+version = "0.1.0"
+description = "vLLM streaming speed benchmark suite"
+authors = [
+    {name = "Mikhail Utrobin", email = "utrobinmv@yandex.ru"},
+]
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+bench_single = "bench_single:run_benchmark"
+bench_multi = "bench_multi:main"
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+    "mypy>=1.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["bench_*"]
+
+[tool.setuptools]
+py-modules = ["bench_single", "bench_multi"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"

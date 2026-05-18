@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Активирует виртуальное окружение проекта openai_llm_speed_benchmark
+#
+# ИСПОЛЬЗОВАНИЕ:
+#   source .venv      (или . .venv)
+# НЕ запускать как:  ./venv  — это создаст подпроцесс, окружение сразу исчезнет!
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "Ошибка: запускай через source:  source .venv"
+    exit 1
+fi
+
+source ~/workspace/venvs/openai_llm_speed_benchmark/serve/bin/activate
