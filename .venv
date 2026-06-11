@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Активирует виртуальное окружение проекта openai_llm_speed_benchmark
+# Активирует виртуальное окружение llm-speed-benchmark
 #
 # ИСПОЛЬЗОВАНИЕ:
 #   source .venv      (или . .venv)
@@ -10,4 +10,4 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     exit 1
 fi
 
-source ~/workspace/venvs/openai_llm_speed_benchmark/serve/bin/activate
+source /home/hermes/workspace/venvs/llm-speed-benchmark/venv/bin/activate

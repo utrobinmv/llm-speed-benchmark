@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-speed-benchmark"
-version = "0.1.0"
+version = "0.1.1"
 description = "vLLM streaming speed benchmark suite"
 authors = [
     {name = "Mikhail Utrobin", email = "utrobinmv@yandex.ru"},
@@ -24,7 +24,11 @@ bench_multi = "bench_multi:main"
 dev = [
     "ruff>=0.4.0",
     "mypy>=1.0.0",
+    "pytest>=7.0.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 include = ["bench_*"]
