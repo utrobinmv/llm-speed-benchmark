@@ -554,20 +554,35 @@ class LiveTable:
 # Основная функция
 # ---------------------------------------------------------------------------
 
-def run_benchmark(workers=4, duration=None, response_width=60, max_context=None):
+def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, api_key=None, model=None, max_context=None):
     """Запускает многопроцессный бенчмарк.
 
     Args:
         workers: Количество воркеров.
         duration: Длительность в секундах (None — до Ctrl+C).
         response_width: Ширина колонки Response.
+        base_url: Переопределение BASE_URL.
+        api_key: Переопределение API_KEY.
+        model: Переопределение MODEL.
         max_context: Переопределение MAX_CONTEXT_TOKENS.
     """
+    # Приоритет: CLI > .env
+    import llm_speed_benchmark.utils as _u
+    if base_url is not None:
+        _u.BASE_URL = base_url
+    if api_key is not None:
+        _u.API_KEY = api_key
+    if model is not None:
+        _u.MODEL = model
+    if max_context is not None:
+        _u.MAX_CONTEXT_TOKENS = max_context
+        _u.TOKEN_LIMIT_WARN = _token_limit_warn()
+
     dur_str = f"{duration}с" if duration is not None else "бесконечно (Ctrl+C)"
     print(f"🚀 Запуск {workers} воркеров на {dur_str}...")
-    print(f"   Модель: {MODEL}")
+    print(f"   Модель: {_u.MODEL}")
     print(f"   Ширина Response: {response_width} символов")
-    print(f"   Макс контекст: {MAX_CONTEXT_TOKENS:,}")
+    print(f"   Макс контекст: {_u.MAX_CONTEXT_TOKENS:,}")
     print(f"   Instant window: {INSTANT_WINDOW} tok")
     print()
 
@@ -667,6 +682,9 @@ def cli():
         prog="bench_multi",
         description="Многопроцессный бенчмарк скорости стриминга LLM",
     )
+    parser.add_argument("--base-url", "-u", type=str, default=None, help="Адрес API (OpenAI-compatible)")
+    parser.add_argument("--api-key", "-k", type=str, default=None, help="API ключ")
+    parser.add_argument("--model", "-m", type=str, default=None, help="Название модели")
     parser.add_argument("--workers", "-w", type=int, default=4, help="Количество воркеров (по умолч. 4)")
     parser.add_argument("--duration", "-d", type=int, default=None, help="Длительность теста в секундах (по умолч. None — до Ctrl+C)")
     parser.add_argument("--response-width", type=int, default=60, help="Ширина колонки Response (по умолч. 60)")
@@ -677,6 +695,9 @@ def cli():
         workers=args.workers,
         duration=args.duration,
         response_width=args.response_width,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        model=args.model,
         max_context=args.max_context,
     )
 
