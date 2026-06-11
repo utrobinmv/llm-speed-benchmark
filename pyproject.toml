@@ -4,8 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-speed-benchmark"
-version = "0.1.1"
-description = "vLLM streaming speed benchmark suite"
+version = "0.2.0"
+description = "Бенчмарк скорости стриминга LLM через vLLM (OpenAI-compatible API)"
+readme = "README.md"
+license = "MIT"
 authors = [
     {name = "Mikhail Utrobin", email = "utrobinmv@yandex.ru"},
 ]
@@ -15,10 +17,15 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
 ]
-
-[project.scripts]
-bench_single = "bench_single:run_benchmark"
-bench_multi = "bench_multi:main"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -27,14 +34,20 @@ dev = [
     "pytest>=7.0.0",
 ]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[project.scripts]
+bench_single = "llm_speed_benchmark.bench_single:cli"
+bench_multi = "llm_speed_benchmark.bench_multi:cli"
+
+[project.urls]
+Homepage = "https://github.com/utrobinmv/llm-speed-benchmark"
+Repository = "https://github.com/utrobinmv/llm-speed-benchmark"
+Issues = "https://github.com/utrobinmv/llm-speed-benchmark/issues"
 
 [tool.setuptools.packages.find]
-include = ["bench_*"]
+where = ["src"]
 
-[tool.setuptools]
-py-modules = ["bench_single", "bench_multi"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120

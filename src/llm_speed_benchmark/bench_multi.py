@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-bench_multi.py
+llm_speed_benchmark/bench_multi.py
 
 Многопроцессный бенчмарк скорости vLLM в режиме стриминга.
 Запускает N изолированных процессов, каждый независимо накапливает контекст,
 выводит обновляемую таблицу с Rich Live — без скролла, на одном экране.
 
 Использование:
-  source .venv
-  python bench_multi.py --workers 4 --duration 30
+  bench_multi
+  bench_multi --workers 8 --duration 60
 """
 
 import os
@@ -20,61 +20,22 @@ import traceback
 from datetime import datetime
 from multiprocessing import Process, Queue, Event
 
-from dotenv import load_dotenv
 from openai import OpenAI
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 from rich.box import DOUBLE
 
-# ---------------------------------------------------------------------------
-# Константы и конфигурация
-# ---------------------------------------------------------------------------
-
-load_dotenv()
-
-API_KEY = os.getenv("API_KEY", "sk-vllm-qwen3.5-0.8b")
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000/v1")
-MODEL = os.getenv("MODEL", "qwen3.5-0.8b")
-MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "262144"))
-
-# Окно для мгновенной скорости (последние N токенов)
-INSTANT_WINDOW = 200
-
-
-def _token_limit_warn():
-    """85% от MAX_CONTEXT_TOKENS — пересчитывается динамически."""
-    return int(MAX_CONTEXT_TOKENS * 0.85)
-
-
-TOKEN_LIMIT_WARN = _token_limit_warn()
-
-# ---------------------------------------------------------------------------
-# Утилиты
-# ---------------------------------------------------------------------------
-
-def truncate_history(messages):
-    """Удаляем самые старые пары user/assistant, оставляем system."""
-    result = list(messages)
-    # Удаляем пары пока не останется только system + 1 пара
-    while len(result) > 3:
-        to_remove = []
-        for i, m in enumerate(result):
-            if m["role"] == "user" and len(to_remove) == 0:
-                to_remove.append(i)
-            elif m["role"] == "assistant" and len(to_remove) == 1:
-                to_remove.append(i)
-                break
-        if not to_remove:
-            break
-        for i in reversed(to_remove):
-            del result[i]
-    return result
-
-
-def format_time(seconds):
-    m, s = divmod(int(seconds), 60)
-    return f"{m:02d}:{s:02d}"
+from .utils import (
+    truncate_history,
+    format_time,
+    API_KEY,
+    BASE_URL,
+    MODEL,
+    MAX_CONTEXT_TOKENS,
+    INSTANT_WINDOW,
+    _token_limit_warn,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -593,22 +554,15 @@ class LiveTable:
 # Основная функция
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="Многопроцессный бенчмарк vLLM")
-    parser.add_argument("--workers", "-w", type=int, default=4, help="Количество воркеров (по умолч. 4)")
-    parser.add_argument("--duration", "-d", type=int, default=None, help="Длительность теста в секундах (по умолч. None — до Ctrl+C)")
-    parser.add_argument("--response-width", type=int, default=60, help="Ширина колонки Response (по умолч. 60)")
-    parser.add_argument("--max-context", type=int, default=None, help="Переопределение MAX_CONTEXT_TOKENS")
-    args = parser.parse_args()
+def run_benchmark(workers=4, duration=None, response_width=60, max_context=None):
+    """Запускает многопроцессный бенчмарк.
 
-    workers = args.workers
-    duration = args.duration
-    response_width = args.response_width
-
-    if args.max_context is not None:
-        global MAX_CONTEXT_TOKENS
-        MAX_CONTEXT_TOKENS = args.max_context
-
+    Args:
+        workers: Количество воркеров.
+        duration: Длительность в секундах (None — до Ctrl+C).
+        response_width: Ширина колонки Response.
+        max_context: Переопределение MAX_CONTEXT_TOKENS.
+    """
     dur_str = f"{duration}с" if duration is not None else "бесконечно (Ctrl+C)"
     print(f"🚀 Запуск {workers} воркеров на {dur_str}...")
     print(f"   Модель: {MODEL}")
@@ -702,5 +656,30 @@ def main():
     console.print()
 
 
+def main():
+    """Legacy entry point — перенаправляет в cli()."""
+    cli()
+
+
+def cli():
+    """CLI entry point для bench_multi."""
+    parser = argparse.ArgumentParser(
+        prog="bench_multi",
+        description="Многопроцессный бенчмарк скорости стриминга LLM",
+    )
+    parser.add_argument("--workers", "-w", type=int, default=4, help="Количество воркеров (по умолч. 4)")
+    parser.add_argument("--duration", "-d", type=int, default=None, help="Длительность теста в секундах (по умолч. None — до Ctrl+C)")
+    parser.add_argument("--response-width", type=int, default=60, help="Ширина колонки Response (по умолч. 60)")
+    parser.add_argument("--max-context", type=int, default=None, help="Переопределение MAX_CONTEXT_TOKENS")
+    args = parser.parse_args()
+
+    run_benchmark(
+        workers=args.workers,
+        duration=args.duration,
+        response_width=args.response_width,
+        max_context=args.max_context,
+    )
+
+
 if __name__ == "__main__":
-    main()
+    cli()

@@ -1,88 +1,37 @@
 #!/usr/bin/env python3
 """
-bench_single.py
+llm_speed_benchmark/bench_single.py
 
 Бенчмарк скорости vLLM в режиме стриминга. Не выводит текст ответа,
 только статистику. Работает до заполнения контекстного окна.
 
 Использование:
-  source .venv
-  python3 bench_single.py
+  bench_single
+  bench_single --duration 60
 """
 
-import os
 import sys
 import time
 import argparse
 
-from dotenv import load_dotenv
-from openai import OpenAI
+from .utils import (
+    get_client,
+    truncate_history,
+    progress_bar,
+    format_time,
+    MODEL,
+    MAX_CONTEXT_TOKENS,
+    INSTANT_WINDOW,
+    _token_limit_warn,
+)
 
-load_dotenv()
-
-API_KEY = os.getenv("API_KEY", "sk-vllm-qwen3.5-0.8b")
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000/v1")
-MODEL = os.getenv("MODEL", "qwen3.5-0.8b")
-MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "262144"))
-
-def _token_limit_warn():
-    """85% от MAX_CONTEXT_TOKENS — пересчитывается динамически."""
-    return int(MAX_CONTEXT_TOKENS * 0.85)
-
-
-TOKEN_LIMIT_WARN = _token_limit_warn()
-
-# Окно для мгновенной скорости (последние N токенов)
-INSTANT_WINDOW = 200
-
-# ---------------------------------------------------------------------------
-# Утилиты
-# ---------------------------------------------------------------------------
-
-def get_client():
-    return OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=600.0)
-
-
-def truncate_history(messages):
-    """Удаляем самые старые пары user/assistant, оставляем system."""
-    result = list(messages)
-    # Удаляем пары пока не останется только system + 1 пара
-    while len(result) > 3:
-        to_remove = []
-        for i, m in enumerate(result):
-            if m["role"] == "user" and len(to_remove) == 0:
-                to_remove.append(i)
-            elif m["role"] == "assistant" and len(to_remove) == 1:
-                to_remove.append(i)
-                break
-        if not to_remove:
-            break
-        for i in reversed(to_remove):
-            del result[i]
-    return result
-
-
-def progress_bar(context_tokens, max_tokens, width=25):
-    if max_tokens == 0:
-        return "[" + "░" * width + "] 0.0%"
-    filled = min(int(width * context_tokens / max_tokens), width)
-    bar = "█" * filled + "░" * (width - filled)
-    pct = min(100.0 * context_tokens / max_tokens, 100.0)
-    return f"[{bar}] {pct:.1f}%"
-
-
-def format_time(seconds):
-    """Форматирует секунды в М:СС."""
-    m = int(seconds // 60)
-    s = int(seconds % 60)
-    return f"{m:02d}:{s:02d}"
-
-
-# ---------------------------------------------------------------------------
-# Основной цикл
-# ---------------------------------------------------------------------------
 
 def run_benchmark(duration=None):
+    """Запускает последовательный бенчмарк.
+
+    Args:
+        duration: Ограничение по времени в секундах (None — до лимита контекста).
+    """
     client = get_client()
 
     messages = [
@@ -102,7 +51,7 @@ def run_benchmark(duration=None):
     print("=" * 70)
     print(f"  Модель:         {MODEL}")
     print(f"  Max context:    {MAX_CONTEXT_TOKENS:,}")
-    print(f"  Предупреждение: {TOKEN_LIMIT_WARN:,} (85%)")
+    print(f"  Предупреждение: {_token_limit_warn():,} (85%)")
     print(f"  Instant window: {INSTANT_WINDOW} tok")
     if duration is not None:
         print(f"  Длительность:   {duration}с")
@@ -111,7 +60,6 @@ def run_benchmark(duration=None):
 
     total_completion_tokens = 0  # cumulative completion tokens from API
     history_tokens = 0
-    prev_completion = 0
     start_wall = time.time()
     turn = 0
     last_stats_time = time.time()
@@ -283,7 +231,6 @@ def run_benchmark(duration=None):
 
             # CallGen = сколько сгенерировали в этом вызове = текущее completion_tokens
             call_gen = completion_tokens
-            prev_completion = total_completion_tokens
 
             avg_speed = total_completion_tokens / wall_total if wall_total > 0 else 0
             total_tokens = history_tokens + completion_tokens
@@ -330,9 +277,19 @@ def run_benchmark(duration=None):
     print("=" * 70)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Бенчмарк скорости стриминга LLM")
-    parser.add_argument("--duration", type=int, default=None,
-                        help="Ограничение по времени в секундах (без параметра — до лимита контекста)")
+def cli():
+    """CLI entry point для bench_single."""
+    parser = argparse.ArgumentParser(
+        prog="bench_single",
+        description="Бенчмарк скорости стриминга LLM (последовательный режим)",
+    )
+    parser.add_argument(
+        "--duration", type=int, default=None,
+        help="Ограничение по времени в секундах (без параметра — до лимита контекста)",
+    )
     args = parser.parse_args()
     run_benchmark(duration=args.duration)
+
+
+if __name__ == "__main__":
+    cli()
