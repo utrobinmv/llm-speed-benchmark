@@ -30,7 +30,11 @@ pip install -e ".[dev]"
 
 ## Настройка
 
-Редактируйте `.env` в рабочей директории или создайте `~/.llm-speed-benchmark.env`:
+Параметры можно задать **тремя способами** (приоритет сверху вниз):
+
+1. **Аргументы командной строки** (высший приоритет)
+2. **Переменные окружения** (`BASE_URL`, `API_KEY`, `MODEL`)
+3. **Файл `.env`** в рабочей директории или `~/.llm-speed-benchmark.env`
 
 ```ini
 BASE_URL=http://localhost:8000/v1
@@ -53,8 +57,10 @@ MAX_CONTEXT_TOKENS=262144
 Последовательные вызовы с накоплением контекста:
 
 ```bash
-bench_single                          # Бежит до лимита контекста
+bench_single                          # Бежит до лимита контекста (из .env)
 bench_single --duration 60            # Ограничение по времени (60 сек)
+bench_single -u http://localhost:8000/v1 -m qwen3.5-0.8b
+bench_single -u http://10.0.0.5:8000/v1 -m llama-3.1-8b --duration 120
 ```
 
 **Метрики:**
@@ -73,6 +79,7 @@ bench_multi -w 8                               # 8 воркеров
 bench_multi -w 4 -d 60                         # 4 воркера, 60 секунд
 bench_multi -w 4 -d 60 --response-width 120    # Широкая колонка ответа
 bench_multi -w 4 --max-context 32768           # Переопределение лимита контекста
+bench_multi -u http://localhost:8000/v1 -m qwen3.5-0.8b -w 4 -d 60
 ```
 
 **Особенности:**
@@ -80,6 +87,18 @@ bench_multi -w 4 --max-context 32768           # Переопределение 
 - При достижении лимита контекста — автоматический новый раунд
 - Live-обновление метрик каждые 0.5 сек
 - Остановка: `Ctrl+C`
+
+### Общие аргументы CLI
+
+| Аргумент | Краткий | Описание |
+|---|---|---|
+| `--base-url` | `-u` | Адрес API (OpenAI-compatible) |
+| `--api-key` | `-k` | API ключ |
+| `--model` | `-m` | Название модели |
+| `--max-context` | | Переопределение MAX_CONTEXT_TOKENS |
+| `--duration` | `-d` | Длительность в секундах (только bench_multi — `-d`, bench_single — `--duration`) |
+| `--workers` | `-w` | Количество воркеров (только bench_multi) |
+| `--response-width` | | Ширина колонки Response (только bench_multi) |
 
 ## Архитектура bench_multi
 

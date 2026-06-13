@@ -71,14 +71,27 @@ MAX_CONTEXT_TOKENS=262144
 
 ## CLI
 
-```bash
-bench_single                          # До лимита контекста
-bench_single --duration 60            # 60 секунд
+Приоритет: **CLI аргументы > переменные окружения > `.env`**
 
-bench_multi                           # 4 воркера, до Ctrl+C
-bench_multi -w 8 -d 60                # 8 воркеров, 60 сек
-bench_multi --response-width 120      # Широкая колонка
-bench_multi --max-context 32768       # Переопределение лимита
+```bash
+# bench_single
+bench_single                                          # До лимита контекста
+bench_single --duration 60                            # 60 секунд
+bench_single -u http://localhost:8000/v1 -m qwen3.5-0.8b
+bench_single -u http://10.0.0.5:8000/v1 -m llama-3.1-8b --duration 120
+
+# bench_multi
+bench_multi                                           # 4 воркера, до Ctrl+C
+bench_multi -w 8 -d 60                                # 8 воркеров, 60 сек
+bench_multi --response-width 120                      # Широкая колонка
+bench_multi --max-context 32768                       # Переопределение лимита
+bench_multi -u http://localhost:8000/v1 -m qwen3.5-0.8b -w 4 -d 60
+
+# Общие аргументы
+-u, --base-url    Адрес API (OpenAI-compatible)
+-k, --api-key     API ключ
+-m, --model       Название модели
+--max-context     Переопределение MAX_CONTEXT_TOKENS
 ```
 
 ## Важные замечания

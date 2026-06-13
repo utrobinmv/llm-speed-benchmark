@@ -43,6 +43,15 @@ bench_single --help
 bench_multi --help
 ```
 
+## Быстрый старт (без `.env`)
+
+Все параметры можно передать через CLI:
+
+```bash
+bench_single -u http://localhost:8000/v1 -m qwen3.5-0.8b --duration 30
+bench_multi -u http://localhost:8000/v1 -m qwen3.5-0.8b -w 4 -d 30
+```
+
 ## Настройка (.env)
 
 Создайте `.env` в рабочей директории или `~/.llm-speed-benchmark.env`:
