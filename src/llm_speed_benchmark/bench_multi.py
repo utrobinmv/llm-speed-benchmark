@@ -135,12 +135,17 @@ def worker(worker_id, q, start_event, duration):
                                     # TTFT
                                     ttft = round(first_token_time - turn_start, 2) if first_token_time is not None else 0
 
+                                    # Средняя скорость за всё время воркера
+                                    wall_elapsed = time.time() - start_time
+                                    avg_sp = round(chunk_count / wall_elapsed, 1) if wall_elapsed > 0 else 0
+
                                     q.put({
                                         "type": "live",
                                         "id": worker_id,
                                         "tail": assistant_content[-100:],
                                         "tok": chunk_count,
                                         "inst": inst_sp,
+                                        "avg": avg_sp,
                                         "ttft": ttft,
                                     })
                                     last_chunk_send = now_chunk
@@ -317,9 +322,11 @@ class LiveTable:
                 return True
             if 0x1FA70 <= cp <= 0x1FAFF:
                 return True
-            if 0x2600 <= cp <= 0x26FF:
+            if 0x2600 <= cp <= 0x26FF:  # Misc Symbols
                 return True
-            if 0x2700 <= cp <= 0x27BF:
+            if 0x2700 <= cp <= 0x27BF:  # Dingbats
+                return True
+            if 0x2300 <= cp <= 0x23FF:  # Misc Technical (⏳⌚⏱⏲⏰▶⏸⏹⏺⏏⏪⏫⏬)
                 return True
             if 0xFE00 <= cp <= 0xFE0F:  # Variation selectors — skip
                 return False
@@ -457,7 +464,8 @@ class LiveTable:
         table.add_column("Gen cum", width=11, justify="right")
         table.add_column("CallGen", width=10, justify="right")
         table.add_column("Total", width=12, justify="right")
-        table.add_column("Speed", width=22, justify="right")
+        table.add_column("Speed", width=9, justify="right")
+        table.add_column("Avg", width=9, justify="right")
         table.add_column("TTFT", width=8, justify="right")
         table.add_column("Time", width=6, justify="center")
         table.add_column("Response", width=self.response_width, overflow="fold")
@@ -471,7 +479,7 @@ class LiveTable:
             if wid in self._errors:
                 table.add_row(
                     wid_str, "", "", "", "", "", "",
-                    "[red]ERROR[/]", "",
+                    "", "[red]ERROR[/]", "",
                     "",
                     self._errors[wid][:55] + "..." if len(self._errors[wid]) > 55 else self._errors[wid]
                 )
@@ -481,7 +489,7 @@ class LiveTable:
             if wid not in active_ids:
                 table.add_row(
                     wid_str, "", "", "", "", "", "",
-                    "[dim]pending[/]", "",
+                    "", "[dim]pend[/]", "",
                     "",
                     "[dim]waiting...[/]"
                 )
@@ -491,16 +499,15 @@ class LiveTable:
                 # Запущен, но ещё нет финальной статистики — показываем live-метрики
                 lm = self.live_metrics.get(wid, {})
                 tail = self._clean_tail(self.live_responses.get(wid, "[dim]waiting...[/]"))
-                tok = lm.get("tok", 0) or 0
                 inst = lm.get("inst", 0) or 0
+                avg = lm.get("avg", 0) or 0
                 ttft = lm.get("ttft", 0) or 0
-                speed_str = f"{tok} tok"
-                if inst > 0:
-                    speed_str += f" | {inst:.0f} inst t/s"
+                speed_str = f"{inst:.0f} t/s" if inst > 0 else ""
+                avg_str = f"{avg:.1f} t/s" if avg > 0 else ""
                 ttft_str = f"{ttft:.2f}s" if ttft > 0 else ""
                 table.add_row(
                     wid_str, "", "", "", "", "", "",
-                    speed_str, ttft_str,
+                    speed_str, avg_str, ttft_str,
                     "",
                     tail
                 )
@@ -513,24 +520,19 @@ class LiveTable:
 
             call_gen = s.get("cg", 0) or 0
 
-            # Speed: берём live-метрики если есть, иначе финальные
+            # Speed = мгновенная, Avg = средняя за всё время
             lm = self.live_metrics.get(wid, {})
+            avg_sp = s.get("avg_speed", 0) or 0
+            avg_str = f"{avg_sp:.1f} t/s" if avg_sp > 0 else ""
             if lm:
-                tok = lm.get("tok", 0) or 0
                 inst = lm.get("inst", 0) or 0
+                speed_str = f"{inst:.0f} t/s" if inst > 0 else ""
                 ttft = lm.get("ttft", 0) or 0
-                speed_str = f"{tok} tok"
-                if inst > 0:
-                    speed_str += f" | {inst:.0f} inst t/s"
-                ttft_str = f"{ttft:.2f}s" if ttft > 0 else ""
             else:
-                avg_sp = s.get("avg_speed", 0) or 0
                 inst_sp = s.get("inst_speed", 0) or 0
-                speed_str = f"{avg_sp:.1f} avg t/s"
-                if inst_sp > 0:
-                    speed_str += f" | {inst_sp:.1f} inst t/s"
+                speed_str = f"{inst_sp:.0f} t/s" if inst_sp > 0 else ""
                 ttft = s.get("ttft", 0) or 0
-                ttft_str = f"{ttft:.2f}s" if ttft > 0 else ""
+            ttft_str = f"{ttft:.2f}s" if ttft > 0 else ""
 
             row = [
                 wid_str,
@@ -541,6 +543,7 @@ class LiveTable:
                 f"{call_gen:>8,}",
                 f"{s['total']:>10,}",
                 speed_str,
+                avg_str,
                 ttft_str,
                 s["wall"],
                 tail
@@ -648,12 +651,22 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
 
     total_avg_ttft = 0.0
     total_ttft_entries = 0
+    total_gen_all = 0
+    total_wall_all = 0.0
     for wid in sorted(live_table.stats.keys()):
         s = live_table.stats[wid]
         ttft = s.get("ttft", 0) or 0
         if ttft > 0:
             total_avg_ttft += ttft
             total_ttft_entries += 1
+        total_gen_all += s.get("g", 0) or 0
+        # Парсим wall time "MM:SS" → секунды
+        wall_str = s.get("wall", "00:00")
+        try:
+            parts = wall_str.split(":")
+            total_wall_all += int(parts[0]) * 60 + int(parts[1])
+        except (ValueError, IndexError):
+            pass
         console.print(
             f"   Worker {wid}: "
             f"[cyan]{s['calls']}[/] calls | "
@@ -661,12 +674,18 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
             f"Prompt: [magenta]{s['p']:,}[/] | "
             f"Gen: [green]{s['g']:,}[/] | "
             f"Avg: [yellow]{s['avg_speed']:.1f}[/] t/s | "
+            f"Time: {s.get('wall', '00:00')} | "
             f"TTFT: {s.get('ttft', 0):.2f}s"
         )
 
     if total_ttft_entries > 0:
         console.print()
         console.print(f"   [bold]Overall Avg TTFT: {total_avg_ttft / total_ttft_entries:.2f}s[/]")
+
+    if total_wall_all > 0:
+        overall_speed = total_gen_all / total_wall_all
+        console.print(f"   [bold]Overall Avg Speed: [yellow]{overall_speed:.1f}[/] t/s "
+                       f"({total_gen_all:,} tok / {format_time(total_wall_all)})")
 
     console.print()
 
