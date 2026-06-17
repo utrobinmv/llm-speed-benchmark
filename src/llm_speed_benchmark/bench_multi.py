@@ -57,12 +57,48 @@ def worker(worker_id, q, start_event, duration):
         start_time = time.time()
         call_count = 0
         total_gen = 0
+        total_chunks = 0  # кумулятивный счётчик чанков с момента старта воркера
         history_tokens = 0
         round_num = 1
         total_ttft = 0.0
         ttft_count = 0
+        tokens_per_chunk = 1.0  # калибруется после первого запроса
 
         start_event.wait()  # Синхронизация старта
+
+        # --- Shared state для потока time_sender ---
+        from threading import Lock
+        _state_lock = Lock()
+        _state = {
+            'total_gen': 0,
+            'tokens_per_chunk': 1.0,
+            'chunk_count': 0,
+            'total_ttft': 0.0,
+        }
+
+        # --- Поток для обновления wall-time каждую секунду ---
+        def _time_sender():
+            while True:
+                time.sleep(1.0)
+                wall = time.time() - start_time
+                if wall > 0:
+                    with _state_lock:
+                        tg = _state['total_gen']
+                        tpc = _state['tokens_per_chunk']
+                        cc = _state['chunk_count']
+                    # Пересчитываем Avg с актуальным временем
+                    est_gen = tg + (cc * tpc)
+                    avg_sp = round(est_gen / wall, 1) if wall > 0 else 0
+                    q.put({
+                        "type": "time",
+                        "id": worker_id,
+                        "wall": format_time(wall),
+                        "avg": avg_sp,
+                    })
+
+        from threading import Thread
+        _time_thread = Thread(target=_time_sender, daemon=True)
+        _time_thread.start()
 
         while duration is None or (time.time() - start_time < duration):
             # Уникальные промпты с ID воркера и раундом
@@ -77,6 +113,7 @@ def worker(worker_id, q, start_event, duration):
                 round_num += 1
                 call_count = 0
                 total_gen = 0
+                # total_chunks НЕ сбрасываем — кумулятивный счётчик с момента старта
                 history_tokens = 0
                 total_ttft = 0.0
                 ttft_count = 0
@@ -116,6 +153,8 @@ def worker(worker_id, q, start_event, duration):
                             if content:
                                 assistant_content += content
                                 chunk_count += 1
+                                with _state_lock:
+                                    _state['chunk_count'] = chunk_count
                                 now_chunk = time.time()
                                 if first_token_time is None:
                                     first_token_time = now_chunk
@@ -123,30 +162,45 @@ def worker(worker_id, q, start_event, duration):
 
                                 # Throttle: отправляем live-обновления не чаще 2 раз/сек
                                 if now_chunk - last_chunk_send >= 0.5:
-                                    # Мгновенная скорость
+                                    # Мгновенная скорость = последние SPEED_WINDOW чанков
                                     inst_sp = 0
-                                    if len(instant_buffer) > INSTANT_WINDOW:
-                                        ws = instant_buffer[-INSTANT_WINDOW][0]
-                                        we = instant_buffer[-1][0]
-                                        wt = instant_buffer[-1][1] - instant_buffer[-INSTANT_WINDOW - 1][1] if len(instant_buffer) > INSTANT_WINDOW + 1 else INSTANT_WINDOW
-                                        wtime = we - ws
-                                        inst_sp = round(wt / wtime, 1) if wtime > 0 else 0
+                                    if len(instant_buffer) >= 2:
+                                        win = min(5, len(instant_buffer) - 1)
+                                        t_start = instant_buffer[-1 - win][0]
+                                        t_end = instant_buffer[-1][0]
+                                        c_start = instant_buffer[-1 - win][1]
+                                        c_end = instant_buffer[-1][1]
+                                        dt = t_end - t_start
+                                        dc = (c_end - c_start) * tokens_per_chunk
+                                        inst_sp = round(dc / dt, 1) if dt > 0 else 0
 
                                     # TTFT
                                     ttft = round(first_token_time - turn_start, 2) if first_token_time is not None else 0
 
                                     # Средняя скорость за всё время воркера
                                     wall_elapsed = time.time() - start_time
-                                    avg_sp = round(chunk_count / wall_elapsed, 1) if wall_elapsed > 0 else 0
+                                    # Gen est = прошлый Gen + чанки в текущем вызове × tokens_per_chunk
+                                    # Никогда не меньше total_gen (прошлый Gen)
+                                    est_gen = total_gen + (chunk_count * tokens_per_chunk)
+                                    # Avg = Gen est / время
+                                    avg_sp = round(est_gen / wall_elapsed, 1) if wall_elapsed > 0 else 0
+
+                                    # TTFT sum = накопленный до этого вызова + TTFT текущего (если уже есть)
+                                    current_ttft = ttft if first_token_time is not None else 0
+                                    ttft_sum_live = total_ttft + current_ttft
 
                                     q.put({
                                         "type": "live",
                                         "id": worker_id,
                                         "tail": assistant_content[-100:],
                                         "tok": chunk_count,
+                                        "est_tok": round(est_gen),
+                                        "chunks": total_chunks + chunk_count,
                                         "inst": inst_sp,
                                         "avg": avg_sp,
                                         "ttft": ttft,
+                                        "ttft_sum": round(ttft_sum_live, 2),
+                                        "wall": format_time(wall_elapsed),
                                     })
                                     last_chunk_send = now_chunk
 
@@ -193,19 +247,39 @@ def worker(worker_id, q, start_event, duration):
                 turn_ttft = 0
 
             total_gen += completion_tokens
+            total_chunks += chunk_count
+
+            # Калибровка: после первого запроса знаем реальное соотношение
+            if chunk_count > 0 and call_count == 1:
+                tokens_per_chunk = completion_tokens / chunk_count
+            elif chunk_count > 0:
+                # Сглаживание: экспоненциальное среднее
+                tokens_per_chunk = tokens_per_chunk * 0.7 + (completion_tokens / chunk_count) * 0.3
+
+            # Обновляем shared state для потока time_sender
+            with _state_lock:
+                _state['total_gen'] = total_gen
+                _state['tokens_per_chunk'] = tokens_per_chunk
+                _state['total_ttft'] = total_ttft
+                _state['chunk_count'] = 0  # сброс для нового вызова
+
             avg_speed = total_gen / wall_total if wall_total > 0 else 0
             curr_speed = completion_tokens / elapsed if elapsed > 0 else 0
 
-            # Мгновенная скорость
+            # Мгновенная скорость = последние 5 чанков
             inst_speed = 0
-            if len(instant_buffer) > INSTANT_WINDOW:
-                window_start = instant_buffer[-INSTANT_WINDOW][0]
-                window_end = instant_buffer[-1][0]
-                window_tokens = instant_buffer[-1][1] - instant_buffer[-INSTANT_WINDOW - 1][1] if len(instant_buffer) > INSTANT_WINDOW + 1 else INSTANT_WINDOW
-                window_time = window_end - window_start
-                inst_speed = window_tokens / window_time if window_time > 0 else 0
+            if len(instant_buffer) >= 2:
+                win = min(5, len(instant_buffer) - 1)
+                t_start = instant_buffer[-1 - win][0]
+                t_end = instant_buffer[-1][0]
+                c_start = instant_buffer[-1 - win][1]
+                c_end = instant_buffer[-1][1]
+                dt = t_end - t_start
+                dc = (c_end - c_start) * tokens_per_chunk
+                inst_speed = round(dc / dt, 1) if dt > 0 else 0
 
             # Отправляем финальную статистику
+            # est_gen = total_gen (уравниваем с реальным значением после стрима)
             q.put({
                 "type": "stats",
                 "id": worker_id,
@@ -213,11 +287,14 @@ def worker(worker_id, q, start_event, duration):
                 "p": history_tokens,
                 "g": total_gen,
                 "cg": completion_tokens,
+                "chunks": total_chunks,  # кумулятивный счётчик чанков
+                "est_gen": total_gen,  # после стрима = точное значение
                 "total": history_tokens + completion_tokens,
                 "speed": round(curr_speed, 1),
                 "avg_speed": round(avg_speed, 1),
                 "inst_speed": round(inst_speed, 1),
                 "ttft": round(turn_ttft, 2),
+                "ttft_sum": round(total_ttft, 2),  # суммарный TTFT всех вызовов
                 "tail": assistant_content[-80:] if assistant_content else "",
                 "wall": format_time(wall_total),
                 "round": round_num,
@@ -237,31 +314,77 @@ def worker(worker_id, q, start_event, duration):
 # ---------------------------------------------------------------------------
 
 class LiveTable:
-    """Динамическая таблица для Rich Live."""
+    """Живая таблица для Rich Live display.
+
+    ОДИН словарь на воркер — все обновления пишут в него, рендер читает из него.
+    """
 
     def __init__(self, duration, total_workers, response_width=60):
         self.duration = duration
         self.total_workers = total_workers
         self.response_width = response_width
-        self.stats = {}          # {id: stat_dict}
-        self.live_responses = {}  # {id: tail_string}
-        self.live_metrics = {}    # {id: {tok, inst, ttft}}
+        self.workers = {}     # {id: {round, calls, prompt, gen, gen_est, chunks,
+                              #        call_gen, total, speed, avg, ttft, ttft_sum,
+                              #        wall, tail}}
+        self._errors = {}     # {id: traceback}
         self.console = Console()
-        self._last_time = ""
-        self._started = set()
-        self._errors = {}  # {id: traceback}
 
-    def update_stats(self, stats):
-        self.stats[stats["id"]] = stats
+    @staticmethod
+    def _merge(w, data):
+        """Merge non-None values from data into worker dict w."""
+        for k, v in data.items():
+            if v is not None:
+                w[k] = v
 
-    def update_response(self, worker_id, tail):
-        self.live_responses[worker_id] = tail
+    def mark_started(self, worker_id):
+        self.workers[worker_id] = {
+            "round": 1, "calls": 0, "prompt": 0, "gen": 0,
+            "gen_est": 0, "chunks": 0, "call_gen": 0, "total": 0,
+            "speed": 0, "avg": 0, "ttft": 0, "ttft_sum": 0,
+            "wall": "", "tail": "[dim]waiting...[/]",
+        }
 
-    def update_live(self, worker_id, metrics):
-        self.live_metrics[worker_id] = metrics
-        # Также обновляем tail
-        if "tail" in metrics:
-            self.live_responses[worker_id] = metrics["tail"]
+    def update_stats(self, msg):
+        w = self.workers.setdefault(msg["id"], {})
+        self._merge(w, {
+            "round": msg.get("round"),
+            "calls": msg.get("calls"),
+            "prompt": msg.get("p"),
+            "gen": msg.get("g"),
+            "gen_est": msg.get("est_gen"),
+            "chunks": msg.get("chunks"),
+            "call_gen": msg.get("cg"),
+            "total": msg.get("total"),
+            "speed": msg.get("inst_speed"),
+            "avg": msg.get("avg_speed"),
+            "ttft": msg.get("ttft"),
+            "ttft_sum": msg.get("ttft_sum"),
+            "wall": msg.get("wall"),
+            "tail": msg.get("tail"),
+        })
+
+    def update_live(self, msg):
+        w = self.workers.setdefault(msg["id"], {})
+        self._merge(w, {
+            "speed": msg.get("inst"),
+            "avg": msg.get("avg"),
+            "ttft": msg.get("ttft"),
+            "ttft_sum": msg.get("ttft_sum"),
+            "gen_est": msg.get("est_tok"),
+            "chunks": msg.get("chunks"),
+            "wall": msg.get("wall"),
+            "tail": msg.get("tail"),
+        })
+
+    def update_time(self, msg):
+        w = self.workers.setdefault(msg["id"], {})
+        self._merge(w, {
+            "wall": msg.get("wall"),
+            "avg": msg.get("avg"),
+        })
+
+    def mark_error(self, worker_id, traceback_str):
+        self._errors[worker_id] = traceback_str
 
     def _clean_tail(self, tail):
         """Очищает и обрезает текст ответа для колонки Response.
@@ -432,18 +555,13 @@ class LiveTable:
 
         return clean
 
-    def mark_started(self, worker_id):
-        self._started.add(worker_id)
-
-    def mark_error(self, worker_id, traceback_str):
-        self._errors[worker_id] = traceback_str
-
     def __rich__(self):
         """Рендерит таблицу для Rich Live."""
         now = datetime.now().strftime("%H:%M:%S")
         dur_str = f"{self.duration}s" if self.duration is not None else "∞"
+        active = len([w for w in self.workers.values() if w.get("calls", 0) > 0])
         info = (
-            f"Workers: {len(self.stats)} active / {self.total_workers} | "
+            f"Workers: {active} active / {self.total_workers} | "
             f"Duration: {dur_str} | "
             f"Model: {MODEL}"
         )
@@ -452,6 +570,8 @@ class LiveTable:
             show_header=True,
             title=f"[bold cyan]LLM Speed Benchmark (MULTI)[/] [dim]{now} — {info}[/]",
             title_style="cyan",
+            caption="[dim]Gen = точные токены (usage) | Gen est = оценка (Gen + чанки_в_вызове × tokens_per_chunk, после стрима = Gen) | Chunks = всего чанков с начала воркера | CallGen = в последнем вызове | Speed = скорость последних 5 чанков | Avg = Gen est / время_воркера (обновляется каждую сек) | TTFT = последний вызов | TTFT sum = суммарный TTFT всех вызовов[/]",
+            caption_style="dim",
             padding=(0, 1),
             highlight=True
         )
@@ -461,92 +581,68 @@ class LiveTable:
         table.add_column("Round", width=6, justify="right")
         table.add_column("Calls", width=6, justify="right")
         table.add_column("Prompt", width=12, justify="right")
-        table.add_column("Gen cum", width=11, justify="right")
+        table.add_column("Gen", width=10, justify="right")
+        table.add_column("Gen est", width=10, justify="right")
+        table.add_column("Chunks", width=9, justify="right")
         table.add_column("CallGen", width=10, justify="right")
         table.add_column("Total", width=12, justify="right")
         table.add_column("Speed", width=9, justify="right")
         table.add_column("Avg", width=9, justify="right")
         table.add_column("TTFT", width=8, justify="right")
+        table.add_column("TTFT sum", width=10, justify="right")
         table.add_column("Time", width=6, justify="center")
         table.add_column("Response", width=self.response_width, overflow="fold")
 
-        # --- Строки воркеров ---
-        active_ids = set(self.stats.keys()) | self._started
-        for wid in range(max(self.total_workers, len(active_ids))):
+        # --- Строки воркеров — ОДНА ветка ---
+        for wid in range(self.total_workers):
             wid_str = str(wid)
 
-            # Проверяем ошибки
+            # Ошибка
             if wid in self._errors:
                 table.add_row(
                     wid_str, "", "", "", "", "", "",
-                    "", "[red]ERROR[/]", "",
-                    "",
+                    "", "", "", "[red]ERROR[/]", "",
+                    "", "",
                     self._errors[wid][:55] + "..." if len(self._errors[wid]) > 55 else self._errors[wid]
                 )
                 continue
 
-            # Проверяем, запущен ли
-            if wid not in active_ids:
+            # Нет в словаре — ещё не запущен
+            if wid not in self.workers:
                 table.add_row(
                     wid_str, "", "", "", "", "", "",
-                    "", "[dim]pend[/]", "",
-                    "",
+                    "", "", "", "[dim]pend[/]", "",
+                    "", "",
                     "[dim]waiting...[/]"
                 )
                 continue
 
-            if wid not in self.stats:
-                # Запущен, но ещё нет финальной статистики — показываем live-метрики
-                lm = self.live_metrics.get(wid, {})
-                tail = self._clean_tail(self.live_responses.get(wid, "[dim]waiting...[/]"))
-                inst = lm.get("inst", 0) or 0
-                avg = lm.get("avg", 0) or 0
-                ttft = lm.get("ttft", 0) or 0
-                speed_str = f"{inst:.0f} t/s" if inst > 0 else ""
-                avg_str = f"{avg:.1f} t/s" if avg > 0 else ""
-                ttft_str = f"{ttft:.2f}s" if ttft > 0 else ""
-                table.add_row(
-                    wid_str, "", "", "", "", "", "",
-                    speed_str, avg_str, ttft_str,
-                    "",
-                    tail
-                )
-                continue
+            # Есть — читаем из одного словаря
+            w = self.workers[wid]
+            tail = self._clean_tail(w.get("tail", "") or "[dim]waiting...[/]")
 
-            s = self.stats[wid]
-
-            # Response: берём live-хвост если есть, иначе финальный
-            tail = self._clean_tail(self.live_responses.get(wid, s.get("tail", "") or ""))
-
-            call_gen = s.get("cg", 0) or 0
-
-            # Speed = мгновенная, Avg = средняя за всё время
-            lm = self.live_metrics.get(wid, {})
-            avg_sp = s.get("avg_speed", 0) or 0
-            avg_str = f"{avg_sp:.1f} t/s" if avg_sp > 0 else ""
-            if lm:
-                inst = lm.get("inst", 0) or 0
-                speed_str = f"{inst:.0f} t/s" if inst > 0 else ""
-                ttft = lm.get("ttft", 0) or 0
-            else:
-                inst_sp = s.get("inst_speed", 0) or 0
-                speed_str = f"{inst_sp:.0f} t/s" if inst_sp > 0 else ""
-                ttft = s.get("ttft", 0) or 0
-            ttft_str = f"{ttft:.2f}s" if ttft > 0 else ""
+            # Форматирование колонок
+            speed = w.get("speed", 0) or 0
+            avg = w.get("avg", 0) or 0
+            ttft = w.get("ttft", 0) or 0
+            ttft_sum = w.get("ttft_sum", 0) or 0
 
             row = [
                 wid_str,
-                str(s.get("round", 1)),
-                str(s["calls"]),
-                f"{s['p']:>10,}",
-                f"{s['g']:>9,}",
-                f"{call_gen:>8,}",
-                f"{s['total']:>10,}",
-                speed_str,
-                avg_str,
-                ttft_str,
-                s["wall"],
-                tail
+                str(w.get("round", 1)) if w.get("calls", 0) > 0 else "",
+                str(w["calls"]) if w.get("calls", 0) > 0 else "",
+                f"{w['prompt']:>10,}" if w.get("prompt", 0) > 0 else "",
+                f"{w['gen']:>9,}" if w.get("gen", 0) > 0 else "",
+                f"{w['gen_est']:>9,}" if w.get("gen_est", 0) > 0 else "",
+                f"{w['chunks']:>8,}" if w.get("chunks", 0) > 0 else "",
+                f"{w['call_gen']:>8,}" if w.get("call_gen", 0) > 0 else "",
+                f"{w['total']:>10,}" if w.get("total", 0) > 0 else "",
+                f"{speed:.0f} t/s" if speed > 0 else "",
+                f"{avg:.1f} t/s" if avg > 0 else "",
+                f"{ttft:.2f}s" if ttft > 0 else "",
+                f"{ttft_sum:.1f}s" if ttft_sum > 0 else "",
+                w.get("wall", ""),
+                tail,
             ]
             table.add_row(*row)
 
@@ -626,7 +722,9 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
                     elif msg_type == "stats":
                         live_table.update_stats(msg)
                     elif msg_type == "live":
-                        live_table.update_live(msg_id, msg)
+                        live_table.update_live(msg)
+                    elif msg_type == "time":
+                        live_table.update_time(msg)
                     elif msg_type == "error":
                         live_table.mark_error(msg_id, msg["traceback"])
                         console.print(f"[red] Воркер {msg_id} упал: {msg.get('traceback', 'unknown error')[:100]}[/]")
@@ -653,15 +751,15 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
     total_ttft_entries = 0
     total_gen_all = 0
     total_wall_all = 0.0
-    for wid in sorted(live_table.stats.keys()):
-        s = live_table.stats[wid]
-        ttft = s.get("ttft", 0) or 0
+    for wid in sorted(live_table.workers.keys()):
+        w = live_table.workers[wid]
+        ttft = w.get("ttft", 0) or 0
         if ttft > 0:
             total_avg_ttft += ttft
             total_ttft_entries += 1
-        total_gen_all += s.get("g", 0) or 0
+        total_gen_all += w.get("gen", 0) or 0
         # Парсим wall time "MM:SS" → секунды
-        wall_str = s.get("wall", "00:00")
+        wall_str = w.get("wall", "00:00")
         try:
             parts = wall_str.split(":")
             total_wall_all += int(parts[0]) * 60 + int(parts[1])
@@ -669,13 +767,13 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
             pass
         console.print(
             f"   Worker {wid}: "
-            f"[cyan]{s['calls']}[/] calls | "
-            f"Round: [bold]{s.get('round', 1)}[/] | "
-            f"Prompt: [magenta]{s['p']:,}[/] | "
-            f"Gen: [green]{s['g']:,}[/] | "
-            f"Avg: [yellow]{s['avg_speed']:.1f}[/] t/s | "
-            f"Time: {s.get('wall', '00:00')} | "
-            f"TTFT: {s.get('ttft', 0):.2f}s"
+            f"[cyan]{w['calls']}[/] calls | "
+            f"Round: [bold]{w.get('round', 1)}[/] | "
+            f"Prompt: [magenta]{w['prompt']:,}[/] | "
+            f"Gen: [green]{w['gen']:,}[/] | "
+            f"Avg: [yellow]{w['avg']:.1f}[/] t/s | "
+            f"Time: {w.get('wall', '00:00')} | "
+            f"TTFT: {w.get('ttft', 0):.2f}s"
         )
 
     if total_ttft_entries > 0:
