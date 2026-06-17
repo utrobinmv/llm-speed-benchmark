@@ -149,9 +149,19 @@ def worker(worker_id, q, start_event, duration):
                     if chunk.choices:
                         delta = chunk.choices[0].delta
                         if delta is not None:
+                            # Модель может стримить reasoning (thinking) отдельно от content
+                            # vLLM: delta.reasoning, OpenAI: delta.reasoning_content
                             content = getattr(delta, 'content', None) or ""
-                            if content:
-                                assistant_content += content
+                            reasoning = getattr(delta, 'reasoning', None) or ""
+                            if not reasoning:
+                                reasoning = getattr(delta, 'reasoning_content', None) or ""
+                            
+                            # Считаем любой не-пустой токен (content или reasoning)
+                            if content or reasoning:
+                                if reasoning:
+                                    assistant_content += reasoning
+                                if content:
+                                    assistant_content += content
                                 chunk_count += 1
                                 with _state_lock:
                                     _state['chunk_count'] = chunk_count
