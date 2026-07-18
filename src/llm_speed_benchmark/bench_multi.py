@@ -4,7 +4,7 @@ llm_speed_benchmark/bench_multi.py
 
 Многопроцессный бенчмарк скорости vLLM в режиме стриминга.
 Запускает N изолированных процессов, каждый независимо накапливает контекст,
-выводит обновляемую таблицу с Rich Live — без скролла, на одном экране.
+выводит обновляемую таблицу с Rich Live -- без скролла, на одном экране.
 
 Использование:
   bench_multi
@@ -31,11 +31,12 @@ from .utils import (
     format_time,
     API_KEY,
     BASE_URL,
-    MODEL,
     MAX_CONTEXT_TOKENS,
-    INSTANT_WINDOW,
+    MODEL,
     _token_limit_warn,
 )
+from .cli_common import add_common_args, apply_config
+from .streaming import StreamSession
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,7 @@ def worker(worker_id, q, start_event, duration):
     """Запускает цикл вызовов LLM в отдельном процессе."""
     try:
         client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=600.0)
+        session = StreamSession(client)
 
         messages = [
             {"role": "system", "content": "Ты полезный помощник. Отвечай подробно и развёрнуто."}
@@ -62,7 +64,6 @@ def worker(worker_id, q, start_event, duration):
         round_num = 1
         total_ttft = 0.0
         ttft_count = 0
-        tokens_per_chunk = 1.0  # калибруется после первого запроса
 
         start_event.wait()  # Синхронизация старта
 
@@ -100,6 +101,26 @@ def worker(worker_id, q, start_event, duration):
         _time_thread = Thread(target=_time_sender, daemon=True)
         _time_thread.start()
 
+        # --- Callback для live-обновлений во время стриминга ---
+        def _on_chunk(chunk_count, inst_sp, avg_sp, ttft, tail, wall_elapsed):
+            # TTFT sum = накопленный до этого вызова + TTFT текущего (если уже есть)
+            current_ttft = ttft if ttft is not None else 0
+            ttft_sum_live = total_ttft + current_ttft
+
+            q.put({
+                "type": "live",
+                "id": worker_id,
+                "tail": tail,
+                "tok": chunk_count,
+                "est_tok": round(total_gen + (chunk_count * session.tokens_per_chunk)),
+                "chunks": total_chunks + chunk_count,
+                "inst": inst_sp,
+                "avg": avg_sp,
+                "ttft": ttft if ttft is not None else 0,
+                "ttft_sum": round(ttft_sum_live, 2),
+                "wall": format_time(wall_elapsed),
+            })
+
         while duration is None or (time.time() - start_time < duration):
             # Уникальные промпты с ID воркера и раундом
             if call_count == 0:
@@ -107,13 +128,13 @@ def worker(worker_id, q, start_event, duration):
             else:
                 prompt_text = f"Поток {worker_id:07d} (раунд {round_num}) продолжай"
 
-            # Проверка лимита контекста — новый раунд
+            # Проверка лимита контекста -- новый раунд
             if history_tokens + total_gen >= MAX_CONTEXT_TOKENS:
                 messages = [{"role": "system", "content": "Ты полезный помощник. Отвечай подробно и развёрнуто."}]
                 round_num += 1
                 call_count = 0
                 total_gen = 0
-                # total_chunks НЕ сбрасываем — кумулятивный счётчик с момента старта
+                # total_chunks НЕ сбрасываем -- кумулятивный счётчик с момента старта
                 history_tokens = 0
                 total_ttft = 0.0
                 ttft_count = 0
@@ -124,95 +145,25 @@ def worker(worker_id, q, start_event, duration):
             messages.append({"role": "user", "content": prompt_text})
 
             turn_start = time.time()
-            completion_tokens = 0
             assistant_content = ""
-            chunk_count = 0
-            first_token_time = None
-            instant_buffer = []
-            last_chunk_send = 0  # throttle для chunk-сообщений
+            metrics = None
 
             try:
-                response = client.chat.completions.create(
-                    model=MODEL,
+                # Настройка callback для live-обновлений
+                session.on_chunk = _on_chunk
+                session.on_chunk_args = {
+                    "total_gen": total_gen,
+                    "start_time": start_time,
+                }
+                session.call_count = call_count
+
+                # === Streaming через StreamSession ===
+                metrics = session.run(
                     messages=messages,
-                    stream=True,
-                    temperature=0.7,
-                    max_tokens=8192,
-                    stream_options={"include_usage": True},
+                    model=MODEL,
                 )
 
-                for chunk in response:
-                    if chunk.usage:
-                        history_tokens = chunk.usage.prompt_tokens or 0
-                        completion_tokens = chunk.usage.completion_tokens or 0
-
-                    if chunk.choices:
-                        delta = chunk.choices[0].delta
-                        if delta is not None:
-                            # Модель может стримить reasoning (thinking) отдельно от content
-                            # vLLM: delta.reasoning, OpenAI: delta.reasoning_content
-                            content = getattr(delta, 'content', None) or ""
-                            reasoning = getattr(delta, 'reasoning', None) or ""
-                            if not reasoning:
-                                reasoning = getattr(delta, 'reasoning_content', None) or ""
-                            
-                            # Считаем любой не-пустой токен (content или reasoning)
-                            if content or reasoning:
-                                if reasoning:
-                                    assistant_content += reasoning
-                                if content:
-                                    assistant_content += content
-                                chunk_count += 1
-                                with _state_lock:
-                                    _state['chunk_count'] = chunk_count
-                                now_chunk = time.time()
-                                if first_token_time is None:
-                                    first_token_time = now_chunk
-                                instant_buffer.append((now_chunk, chunk_count))
-
-                                # Throttle: отправляем live-обновления не чаще 2 раз/сек
-                                if now_chunk - last_chunk_send >= 0.5:
-                                    # Мгновенная скорость = последние SPEED_WINDOW чанков
-                                    inst_sp = 0
-                                    if len(instant_buffer) >= 2:
-                                        win = min(5, len(instant_buffer) - 1)
-                                        t_start = instant_buffer[-1 - win][0]
-                                        t_end = instant_buffer[-1][0]
-                                        c_start = instant_buffer[-1 - win][1]
-                                        c_end = instant_buffer[-1][1]
-                                        dt = t_end - t_start
-                                        dc = (c_end - c_start) * tokens_per_chunk
-                                        inst_sp = round(dc / dt, 1) if dt > 0 else 0
-
-                                    # TTFT
-                                    ttft = round(first_token_time - turn_start, 2) if first_token_time is not None else 0
-
-                                    # Средняя скорость за всё время воркера
-                                    wall_elapsed = time.time() - start_time
-                                    # Gen est = прошлый Gen + чанки в текущем вызове × tokens_per_chunk
-                                    # Никогда не меньше total_gen (прошлый Gen)
-                                    est_gen = total_gen + (chunk_count * tokens_per_chunk)
-                                    # Avg = Gen est / время
-                                    avg_sp = round(est_gen / wall_elapsed, 1) if wall_elapsed > 0 else 0
-
-                                    # TTFT sum = накопленный до этого вызова + TTFT текущего (если уже есть)
-                                    current_ttft = ttft if first_token_time is not None else 0
-                                    ttft_sum_live = total_ttft + current_ttft
-
-                                    q.put({
-                                        "type": "live",
-                                        "id": worker_id,
-                                        "tail": assistant_content[-100:],
-                                        "tok": chunk_count,
-                                        "est_tok": round(est_gen),
-                                        "chunks": total_chunks + chunk_count,
-                                        "inst": inst_sp,
-                                        "avg": avg_sp,
-                                        "ttft": ttft,
-                                        "ttft_sum": round(ttft_sum_live, 2),
-                                        "wall": format_time(wall_elapsed),
-                                    })
-                                    last_chunk_send = now_chunk
+                assistant_content = metrics.assistant_content
 
             except Exception as e:
                 assistant_content = f"[red]Error: {e}[/]"
@@ -224,9 +175,28 @@ def worker(worker_id, q, start_event, duration):
             call_count += 1
             wall_total = time.time() - start_time
 
-            # Fallback: если usage не пришло — используем chunk_count
-            if completion_tokens == 0:
-                completion_tokens = chunk_count
+            # Если ошибка в stream -- пропускаем
+            if metrics is None:
+                q.put({
+                    "type": "stats",
+                    "id": worker_id,
+                    "calls": call_count,
+                    "p": history_tokens,
+                    "g": total_gen,
+                    "cg": 0,
+                    "total": history_tokens,
+                    "speed": 0,
+                    "avg_speed": 0,
+                    "inst_speed": 0,
+                    "ttft": 0,
+                    "tail": assistant_content[:80] if assistant_content else "error",
+                    "wall": format_time(wall_total),
+                    "round": round_num,
+                })
+                continue
+
+            completion_tokens = metrics.completion_tokens
+            chunk_count = metrics.chunk_count
 
             # Защита: пустой ответ
             if completion_tokens == 0:
@@ -242,15 +212,15 @@ def worker(worker_id, q, start_event, duration):
                     "avg_speed": 0,
                     "inst_speed": 0,
                     "ttft": 0,
-                    "tail": "⚠️ empty",
+                    "tail": "empty",
                     "wall": format_time(wall_total),
                     "round": round_num,
                 })
                 continue
 
             # TTFT
-            if first_token_time is not None:
-                turn_ttft = first_token_time - turn_start
+            if metrics.ttft is not None:
+                turn_ttft = metrics.ttft
                 total_ttft += turn_ttft
                 ttft_count += 1
             else:
@@ -259,37 +229,16 @@ def worker(worker_id, q, start_event, duration):
             total_gen += completion_tokens
             total_chunks += chunk_count
 
-            # Калибровка: после первого запроса знаем реальное соотношение
-            if chunk_count > 0 and call_count == 1:
-                tokens_per_chunk = completion_tokens / chunk_count
-            elif chunk_count > 0:
-                # Сглаживание: экспоненциальное среднее
-                tokens_per_chunk = tokens_per_chunk * 0.7 + (completion_tokens / chunk_count) * 0.3
-
             # Обновляем shared state для потока time_sender
             with _state_lock:
                 _state['total_gen'] = total_gen
-                _state['tokens_per_chunk'] = tokens_per_chunk
+                _state['tokens_per_chunk'] = session.tokens_per_chunk
                 _state['total_ttft'] = total_ttft
                 _state['chunk_count'] = 0  # сброс для нового вызова
 
             avg_speed = total_gen / wall_total if wall_total > 0 else 0
-            curr_speed = completion_tokens / elapsed if elapsed > 0 else 0
-
-            # Мгновенная скорость = последние 5 чанков
-            inst_speed = 0
-            if len(instant_buffer) >= 2:
-                win = min(5, len(instant_buffer) - 1)
-                t_start = instant_buffer[-1 - win][0]
-                t_end = instant_buffer[-1][0]
-                c_start = instant_buffer[-1 - win][1]
-                c_end = instant_buffer[-1][1]
-                dt = t_end - t_start
-                dc = (c_end - c_start) * tokens_per_chunk
-                inst_speed = round(dc / dt, 1) if dt > 0 else 0
 
             # Отправляем финальную статистику
-            # est_gen = total_gen (уравниваем с реальным значением после стрима)
             q.put({
                 "type": "stats",
                 "id": worker_id,
@@ -297,14 +246,14 @@ def worker(worker_id, q, start_event, duration):
                 "p": history_tokens,
                 "g": total_gen,
                 "cg": completion_tokens,
-                "chunks": total_chunks,  # кумулятивный счётчик чанков
+                "chunks": total_chunks,
                 "est_gen": total_gen,  # после стрима = точное значение
                 "total": history_tokens + completion_tokens,
-                "speed": round(curr_speed, 1),
+                "speed": round(metrics.call_speed, 1),
                 "avg_speed": round(avg_speed, 1),
-                "inst_speed": round(inst_speed, 1),
+                "inst_speed": round(metrics.instant_speed, 1),
                 "ttft": round(turn_ttft, 2),
-                "ttft_sum": round(total_ttft, 2),  # суммарный TTFT всех вызовов
+                "ttft_sum": round(total_ttft, 2),
                 "tail": assistant_content[-80:] if assistant_content else "",
                 "wall": format_time(wall_total),
                 "round": round_num,
@@ -326,7 +275,7 @@ def worker(worker_id, q, start_event, duration):
 class LiveTable:
     """Живая таблица для Rich Live display.
 
-    ОДИН словарь на воркер — все обновления пишут в него, рендер читает из него.
+    ОДИН словарь на воркер -- все обновления пишут в него, рендер читает из него.
     """
 
     def __init__(self, duration, total_workers, response_width=60):
@@ -399,7 +348,7 @@ class LiveTable:
     def _clean_tail(self, tail):
         """Очищает и обрезает текст ответа для колонки Response.
 
-        Заменяет wide-символы (CJK, эмодзи, пиктограммы — 2+ ячейки) на точки,
+        Заменяет wide-символы (CJK, эмодзи, пиктограммы -- 2+ ячейки) на точки,
         так как они ломают ширину колонки. Кириллица, латиница и другие
         1-ячеечные символы сохраняются.
         """
@@ -459,13 +408,13 @@ class LiveTable:
                 return True
             if 0x2700 <= cp <= 0x27BF:  # Dingbats
                 return True
-            if 0x2300 <= cp <= 0x23FF:  # Misc Technical (⏳⌚⏱⏲⏰▶⏸⏹⏺⏏⏪⏫⏬)
+            if 0x2300 <= cp <= 0x23FF:  # Misc Technical
                 return True
-            if 0xFE00 <= cp <= 0xFE0F:  # Variation selectors — skip
+            if 0xFE00 <= cp <= 0xFE0F:  # Variation selectors -- skip
                 return False
             if 0xFE30 <= cp <= 0xFE4F:
                 return True
-            if 0x2000 <= cp <= 0x206F:  # General punctuation — narrow
+            if 0x2000 <= cp <= 0x206F:  # General punctuation -- narrow
                 return False
             return False
 
@@ -568,7 +517,7 @@ class LiveTable:
     def __rich__(self):
         """Рендерит таблицу для Rich Live."""
         now = datetime.now().strftime("%H:%M:%S")
-        dur_str = f"{self.duration}s" if self.duration is not None else "∞"
+        dur_str = f"{self.duration}s" if self.duration is not None else "\u221e"
         active = len([w for w in self.workers.values() if w.get("calls", 0) > 0])
         info = (
             f"Workers: {active} active / {self.total_workers} | "
@@ -578,9 +527,9 @@ class LiveTable:
         table = Table(
             box=DOUBLE,
             show_header=True,
-            title=f"[bold cyan]LLM Speed Benchmark (MULTI)[/] [dim]{now} — {info}[/]",
+            title=f"[bold cyan]LLM Speed Benchmark (MULTI)[/] [dim]{now} -- {info}[/]",
             title_style="cyan",
-            caption="[dim]Gen = точные токены (usage) | Gen est = оценка (Gen + чанки_в_вызове × tokens_per_chunk, после стрима = Gen) | Chunks = всего чанков с начала воркера | CallGen = в последнем вызове | Speed = скорость последних 5 чанков | Avg = Gen est / время_воркера (обновляется каждую сек) | TTFT = последний вызов | TTFT sum = суммарный TTFT всех вызовов[/]",
+            caption="[dim]Gen = точные токены (usage) | Gen est = оценка (Gen + чанки_в_вызове x tokens_per_chunk, после стрима = Gen) | Chunks = всего чанков с начала воркера | CallGen = в последнем вызове | Speed = скорость последних 5 чанков | Avg = Gen est / время_воркера (обновляется каждую сек) | TTFT = последний вызов | TTFT sum = суммарный TTFT всех вызовов[/]",
             caption_style="dim",
             padding=(0, 1),
             highlight=True
@@ -603,7 +552,7 @@ class LiveTable:
         table.add_column("Time", width=6, justify="center")
         table.add_column("Response", width=self.response_width, overflow="fold")
 
-        # --- Строки воркеров — ОДНА ветка ---
+        # --- Строки воркеров -- ОДНА ветка ---
         for wid in range(self.total_workers):
             wid_str = str(wid)
 
@@ -617,7 +566,7 @@ class LiveTable:
                 )
                 continue
 
-            # Нет в словаре — ещё не запущен
+            # Нет в словаре -- ещё не запущен
             if wid not in self.workers:
                 table.add_row(
                     wid_str, "", "", "", "", "", "",
@@ -627,7 +576,7 @@ class LiveTable:
                 )
                 continue
 
-            # Есть — читаем из одного словаря
+            # Есть -- читаем из одного словаря
             w = self.workers[wid]
             tail = self._clean_tail(w.get("tail", "") or "[dim]waiting...[/]")
 
@@ -668,31 +617,22 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
 
     Args:
         workers: Количество воркеров.
-        duration: Длительность в секундах (None — до Ctrl+C).
+        duration: Длительность в секундах (None -- до Ctrl+C).
         response_width: Ширина колонки Response.
         base_url: Переопределение BASE_URL.
         api_key: Переопределение API_KEY.
         model: Переопределение MODEL.
         max_context: Переопределение MAX_CONTEXT_TOKENS.
     """
-    # Приоритет: CLI > .env
-    import llm_speed_benchmark.utils as _u
-    if base_url is not None:
-        _u.BASE_URL = base_url
-    if api_key is not None:
-        _u.API_KEY = api_key
-    if model is not None:
-        _u.MODEL = model
-    if max_context is not None:
-        _u.MAX_CONTEXT_TOKENS = max_context
-        _u.TOKEN_LIMIT_WARN = _token_limit_warn()
+    apply_config(base_url=base_url, api_key=api_key, model=model, max_context=max_context)
+
+    import llm_speed_benchmark.utils as _u  # noqa: PLC0414
 
     dur_str = f"{duration}с" if duration is not None else "бесконечно (Ctrl+C)"
-    print(f"🚀 Запуск {workers} воркеров на {dur_str}...")
+    print(f"Запуск {workers} воркеров на {dur_str}...")
     print(f"   Модель: {_u.MODEL}")
     print(f"   Ширина Response: {response_width} символов")
     print(f"   Макс контекст: {_u.MAX_CONTEXT_TOKENS:,}")
-    print(f"   Instant window: {INSTANT_WINDOW} tok")
     print()
 
     q = Queue()
@@ -701,7 +641,7 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
     console = Console()
 
     def sigint_handler(signum, frame):
-        console.print("\n[red]⏹[/] Прервано пользователем. Остановка...")
+        console.print("\n[red]Stopped[/] Прервано пользователем. Остановка...")
         for p in processes:
             p.terminate()
         sys.exit(0)
@@ -753,7 +693,7 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
             p.terminate()
             p.join()
 
-    console.print("\n[cyan]✅ Бенчмарк завершён.[/]")
+    console.print("\n[cyan]Бенчмарк завершён.[/]")
     console.print(f"   Запущено: {len(processes)} воркеров | Длительность: {duration}с")
     console.print()
 
@@ -768,7 +708,7 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
             total_avg_ttft += ttft
             total_ttft_entries += 1
         total_gen_all += w.get("gen", 0) or 0
-        # Парсим wall time "MM:SS" → секунды
+        # Парсим wall time "MM:SS" -> секунды
         wall_str = w.get("wall", "00:00")
         try:
             parts = wall_str.split(":")
@@ -799,7 +739,7 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
 
 
 def main():
-    """Legacy entry point — перенаправляет в cli()."""
+    """Legacy entry point -- перенаправляет в cli()."""
     cli()
 
 
@@ -809,13 +749,19 @@ def cli():
         prog="bench_multi",
         description="Многопроцессный бенчмарк скорости стриминга LLM",
     )
-    parser.add_argument("--base-url", "-u", type=str, default=None, help="Адрес API (OpenAI-compatible)")
-    parser.add_argument("--api-key", "-k", type=str, default=None, help="API ключ")
-    parser.add_argument("--model", "-m", type=str, default=None, help="Название модели")
-    parser.add_argument("--workers", "-w", type=int, default=4, help="Количество воркеров (по умолч. 4)")
-    parser.add_argument("--duration", "-d", type=int, default=None, help="Длительность теста в секундах (по умолч. None — до Ctrl+C)")
-    parser.add_argument("--response-width", type=int, default=60, help="Ширина колонки Response (по умолч. 60)")
-    parser.add_argument("--max-context", type=int, default=None, help="Переопределение MAX_CONTEXT_TOKENS")
+    add_common_args(parser)
+    parser.add_argument(
+        "--workers", "-w", type=int, default=4,
+        help="Количество воркеров (по умолч. 4)",
+    )
+    parser.add_argument(
+        "--duration", "-d", type=int, default=None,
+        help="Длительность теста в секундах (по умолч. None -- до Ctrl+C)",
+    )
+    parser.add_argument(
+        "--response-width", type=int, default=60,
+        help="Ширина колонки Response (по умолч. 60)",
+    )
     args = parser.parse_args()
 
     run_benchmark(

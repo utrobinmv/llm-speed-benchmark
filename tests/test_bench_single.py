@@ -253,7 +253,7 @@ class TestRunBenchmark:
         )
         mock_get_client.return_value = mock_client
 
-        with patch("llm_speed_benchmark.bench_single.MAX_CONTEXT_TOKENS", 150):
+        with patch("llm_speed_benchmark.utils.MAX_CONTEXT_TOKENS", 150):
             with patch("llm_speed_benchmark.bench_single._token_limit_warn", return_value=127):
                 run_benchmark()
 
@@ -269,7 +269,7 @@ class TestRunBenchmark:
         )
         mock_get_client.return_value = mock_client
 
-        with patch("llm_speed_benchmark.bench_single.MAX_CONTEXT_TOKENS", 50):
+        with patch("llm_speed_benchmark.utils.MAX_CONTEXT_TOKENS", 50):
             with patch("llm_speed_benchmark.bench_single._token_limit_warn", return_value=42):
                 run_benchmark()
 
@@ -285,7 +285,7 @@ class TestRunBenchmark:
         )
         mock_get_client.return_value = mock_client
 
-        with patch("llm_speed_benchmark.bench_single.MAX_CONTEXT_TOKENS", 1000):
+        with patch("llm_speed_benchmark.utils.MAX_CONTEXT_TOKENS", 1000):
             with patch("llm_speed_benchmark.bench_single._token_limit_warn", return_value=850):
                 with patch("llm_speed_benchmark.bench_single.truncate_history", wraps=truncate_history) as mock_trunc:
                     run_benchmark()
@@ -316,7 +316,7 @@ class TestRunBenchmark:
     @patch("llm_speed_benchmark.bench_single.get_client")
     @patch("builtins.print")
     def test_empty_response_handling(self, mock_print, mock_get_client):
-        """Пустой ответ от модели → skip, не зацикливается."""
+        """Пустой ответ от модели -> skip, не зацикливается."""
         mock_client = MagicMock()
         call_count = [0]
         def side_effect(**kw):
@@ -327,7 +327,7 @@ class TestRunBenchmark:
         mock_client.chat.completions.create.side_effect = side_effect
         mock_get_client.return_value = mock_client
 
-        with patch("llm_speed_benchmark.bench_single.MAX_CONTEXT_TOKENS", 50):
+        with patch("llm_speed_benchmark.utils.MAX_CONTEXT_TOKENS", 50):
             with patch("llm_speed_benchmark.bench_single._token_limit_warn", return_value=42):
                 run_benchmark()
 

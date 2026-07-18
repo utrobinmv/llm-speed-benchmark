@@ -19,36 +19,28 @@ from .utils import (
     truncate_history,
     progress_bar,
     format_time,
-    MODEL,
-    MAX_CONTEXT_TOKENS,
-    INSTANT_WINDOW,
     _token_limit_warn,
 )
+from .cli_common import add_common_args, apply_config
+from .streaming import StreamSession
 
 
 def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_context=None):
     """Запускает последовательный бенчмарк.
 
     Args:
-        duration: Ограничение по времени в секундах (None — до лимита контекста).
+        duration: Ограничение по времени в секундах (None -- до лимита контекста).
         base_url: Переопределение BASE_URL.
         api_key: Переопределение API_KEY.
         model: Переопределение MODEL.
         max_context: Переопределение MAX_CONTEXT_TOKENS.
     """
-    # Приоритет: CLI > .env
-    import llm_speed_benchmark.utils as _u
-    if base_url is not None:
-        _u.BASE_URL = base_url
-    if api_key is not None:
-        _u.API_KEY = api_key
-    if model is not None:
-        _u.MODEL = model
-    if max_context is not None:
-        _u.MAX_CONTEXT_TOKENS = max_context
-        _u.TOKEN_LIMIT_WARN = _token_limit_warn()
+    apply_config(base_url=base_url, api_key=api_key, model=model, max_context=max_context)
+
+    import llm_speed_benchmark.utils as _u  # noqa: PLC0414
 
     client = get_client()
+    session = StreamSession(client)
 
     messages = [
         {
@@ -68,13 +60,12 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
     print(f"  Модель:         {_u.MODEL}")
     print(f"  Max context:    {_u.MAX_CONTEXT_TOKENS:,}")
     print(f"  Предупреждение: {_token_limit_warn():,} (85%)")
-    print(f"  Instant window: {INSTANT_WINDOW} tok")
     if duration is not None:
         print(f"  Длительность:   {duration}с")
     print("=" * 70)
     print()
 
-    total_completion_tokens = 0  # cumulative completion tokens from API
+    total_completion_tokens = 0
     history_tokens = 0
     start_wall = time.time()
     turn = 0
@@ -86,7 +77,7 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
 
     try:
         while True:
-            # Проверка по времени (duration is not None — корректно для 0)
+            # Проверка по времени (duration is not None -- корректно для 0)
             if duration is not None and (time.time() - start_wall) >= duration:
                 break
 
@@ -94,7 +85,7 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
             prompt_text = prompts[0 if turn == 1 else 1]
 
             # Проверка контекста
-            if history_tokens + total_completion_tokens >= MAX_CONTEXT_TOKENS:
+            if history_tokens + total_completion_tokens >= _u.MAX_CONTEXT_TOKENS:
                 break
 
             if history_tokens + total_completion_tokens >= _token_limit_warn():
@@ -105,113 +96,36 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
             turn_start = time.time()
             last_tick = time.time()
 
-            response = client.chat.completions.create(
-                model=MODEL,
+            # === Streaming через StreamSession ===
+            metrics = session.run(
                 messages=messages,
-                stream=True,
-                temperature=0.7,
-                max_tokens=8192,
-                stream_options={"include_usage": True},
+                model=_u.MODEL,
             )
 
-            # === Извлекаем completion_tokens и собираем ответ ассистента ===
-            completion_tokens = 0
-            history_tokens = 0
-            assistant_content = ""
-            chunk_count = 0  # ≈ токены в реальном времени (1 чанк ≈ 1 токен)
-            first_token_time = None  # время прихода первого токена
+            completion_tokens = metrics.completion_tokens
+            history_tokens = metrics.prompt_tokens
+            chunk_count = metrics.chunk_count
+            first_token_time = (
+                turn_start + metrics.ttft if metrics.ttft is not None else None
+            )
+            assistant_content = metrics.assistant_content
+            elapsed = metrics.elapsed
 
-            # Для мгновенной скорости: (timestamp, cumulative_chunk) для каждого чанка
-            instant_buffer = []
-
-            for chunk in response:
-                if chunk.usage:
-                    history_tokens = chunk.usage.prompt_tokens or 0
-                    completion_tokens = chunk.usage.completion_tokens or 0
-
-                # Собираем контент ассистента для истории
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if delta is not None:
-                        content = getattr(delta, 'content', None) or ""
-                        if content:
-                            assistant_content += content
-                            chunk_count += 1
-                            now_chunk = time.time()
-                            if first_token_time is None:
-                                first_token_time = now_chunk
-                            instant_buffer.append((now_chunk, chunk_count))
-
-                # Live update каждые 1с — считаем реальные чанки
-                now = time.time()
-                if now - last_tick >= 1.0:
-                    elapsed = now - turn_start
-                    if completion_tokens > 0:
-                        # Usage пришло (финальный чанк) — точная цифра
-                        est_tokens = completion_tokens
-                    elif chunk_count > 0:
-                        # Стрим идёт — считаем чанки как ≈ токены
-                        est_tokens = chunk_count
-                    else:
-                        # Ещё ничего не пришло — не выводим мусор
-                        est_tokens = 0
-
-                    # Мгновенная скорость: последние INSTANT_WINDOW токенов
-                    instant_speed = 0
-                    if len(instant_buffer) > INSTANT_WINDOW:
-                        window_start = instant_buffer[-INSTANT_WINDOW][0]
-                        window_end = instant_buffer[-1][0]
-                        window_tokens = instant_buffer[-1][1] - instant_buffer[-INSTANT_WINDOW - 1][1] if len(instant_buffer) > INSTANT_WINDOW + 1 else INSTANT_WINDOW
-                        window_time = window_end - window_start
-                        instant_speed = window_tokens / window_time if window_time > 0 else 0
-
-                    # TTFT для этого turn'а
-                    ttft = (first_token_time - turn_start) if first_token_time is not None else None
-
-                    # Форматируем live строку
-                    if completion_tokens > 0:
-                        speed = completion_tokens / elapsed if elapsed > 0 else 0
-                    elif chunk_count > 0:
-                        speed = chunk_count / elapsed if elapsed > 0 else 0
-                    else:
-                        speed = 0
-
-                    live_parts = f"⏱ {est_tokens:,} tok | {speed:.0f} avg t/s"
-                    if instant_speed > 0:
-                        live_parts += f" | {instant_speed:.0f} inst t/s"
-                    if ttft is not None:
-                        live_parts += f" | TTFT {ttft:.2f}s"
-
-                    print(f"\r   {live_parts}          ", end="", flush=True)
-                    last_tick = now
-
-            # После завершения стриминга — последнее обновление live
+            # Live update каждые 1с -- уже завершён, показываем финал
             now = time.time()
             if now - last_tick >= 0.5:
-                elapsed_live = now - turn_start
                 if completion_tokens > 0:
-                    # Точная цифра из usage
-                    speed_live = completion_tokens / elapsed_live
+                    speed = completion_tokens / elapsed if elapsed > 0 else 0
                     final_tokens = completion_tokens
                 else:
-                    # Fallback на чанки (если usage не пришло)
-                    speed_live = chunk_count / elapsed_live if elapsed_live > 0 else 0
+                    speed = chunk_count / elapsed if elapsed > 0 else 0
                     final_tokens = chunk_count
 
-                # Мгновенная скорость
-                instant_speed = 0
-                if len(instant_buffer) > INSTANT_WINDOW:
-                    window_start = instant_buffer[-INSTANT_WINDOW][0]
-                    window_end = instant_buffer[-1][0]
-                    window_tokens = instant_buffer[-1][1] - instant_buffer[-INSTANT_WINDOW - 1][1] if len(instant_buffer) > INSTANT_WINDOW + 1 else INSTANT_WINDOW
-                    window_time = window_end - window_start
-                    instant_speed = window_tokens / window_time if window_time > 0 else 0
+                ttft = metrics.ttft
 
-                ttft = (first_token_time - turn_start) if first_token_time is not None else None
-
-                live_parts = f"⏱ {final_tokens:,} tok | {speed_live:.0f} avg t/s"
-                if instant_speed > 0:
-                    live_parts += f" | {instant_speed:.0f} inst t/s"
+                live_parts = f"  {final_tokens:,} tok | {speed:.0f} avg t/s"
+                if metrics.instant_speed > 0:
+                    live_parts += f" | {metrics.instant_speed:.0f} inst t/s"
                 if ttft is not None:
                     live_parts += f" | TTFT {ttft:.2f}s"
 
@@ -223,22 +137,16 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
                 messages.append({"role": "assistant", "content": assistant_content})
 
             # Итоги хода
-            elapsed = time.time() - turn_start
             wall_total = time.time() - start_wall
 
-            # Если usage не пришло — используем счётчик чанков (≈ токены)
+            # Защита: если модель ничего не вернула -- пропускаем turn
             if completion_tokens == 0:
-                completion_tokens = chunk_count
-
-            # Защита: если модель ничего не вернула — пропускаем turn
-            if completion_tokens == 0:
-                print(f"\r\033[2KCall {turn:>3} | ⚠️ Пустой ответ, пропускаю...")
+                print(f"\r\033[2KCall {turn:>3} | Внимание: пустой ответ, пропускаю...")
                 continue
 
             # Суммируем TTFT
-            if first_token_time is not None:
-                turn_ttft = first_token_time - turn_start
-                total_ttft += turn_ttft
+            if metrics.ttft is not None:
+                total_ttft += metrics.ttft
                 ttft_count += 1
 
             # chunk.usage.completion_tokens от vLLM = токены текущего запроса
@@ -250,22 +158,22 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
 
             avg_speed = total_completion_tokens / wall_total if wall_total > 0 else 0
             total_tokens = history_tokens + completion_tokens
-            speed = call_gen / elapsed if elapsed > 0 else 0
+            speed = metrics.call_speed
 
             # === Статичная строка ===
-            turn_ttft_str = f" | TTFT {turn_ttft:.2f}s" if first_token_time is not None else ""
+            turn_ttft_str = f" | TTFT {metrics.ttft:.2f}s" if metrics.ttft is not None else ""
             print(f"\r\033[2KCall {turn:>3} | "
                   f"Prompt {history_tokens:,} | "
                   f"Gen {total_completion_tokens:,} | "
                   f"Call {call_gen:,} | "
-                  f"Total {total_tokens:,} / {MAX_CONTEXT_TOKENS:,} | "
-                  f"{progress_bar(total_tokens, MAX_CONTEXT_TOKENS)} | "
-                  f"⏱ {format_time(wall_total)} | "
+                  f"Total {total_tokens:,} / {_u.MAX_CONTEXT_TOKENS:,} | "
+                  f"{progress_bar(total_tokens, _u.MAX_CONTEXT_TOKENS)} | "
+                  f"  {format_time(wall_total)} | "
                   f"Speed {speed:.1f} t/s | "
                   f"Avg {avg_speed:.1f} t/s{turn_ttft_str}")
 
     except KeyboardInterrupt:
-        print("\n⏹ Прервано.")
+        print("\nПрервано.")
     except Exception as e:
         print(f"\n\nОшибка: {e}")
         import traceback
@@ -299,11 +207,11 @@ def cli():
         prog="bench_single",
         description="Бенчмарк скорости стриминга LLM (последовательный режим)",
     )
-    parser.add_argument("--base-url", "-u", type=str, default=None, help="Адрес API (OpenAI-compatible)")
-    parser.add_argument("--api-key", "-k", type=str, default=None, help="API ключ")
-    parser.add_argument("--model", "-m", type=str, default=None, help="Название модели")
-    parser.add_argument("--max-context", type=int, default=None, help="Переопределение MAX_CONTEXT_TOKENS")
-    parser.add_argument("--duration", type=int, default=None, help="Ограничение по времени в секундах (без параметра — до лимита контекста)")
+    add_common_args(parser)
+    parser.add_argument(
+        "--duration", type=int, default=None,
+        help="Ограничение по времени в секундах (без параметра -- до лимита контекста)",
+    )
     args = parser.parse_args()
     run_benchmark(
         duration=args.duration,
