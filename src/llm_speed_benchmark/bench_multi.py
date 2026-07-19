@@ -39,22 +39,38 @@ from .cli_common import add_common_args, apply_config
 from .streaming import StreamSession
 
 
-# ---------------------------------------------------------------------------
-# Воркер
-# ---------------------------------------------------------------------------
+def worker(  # type: ignore[reportInvalidTypeForm]
+    worker_id: int,
+    q: "Queue",
+    start_event: "Event",
+    duration: int | None,
+    initial_messages: list[dict] | None = None,
+) -> None:
+    """Запускает цикл вызовов LLM в отдельном процессе.
 
-def worker(worker_id, q, start_event, duration):
-    """Запускает цикл вызовов LLM в отдельном процессе."""
+    Args:
+        worker_id: ID воркера.
+        q: Queue для сообщений.
+        start_event: Event для синхронизации старта.
+        duration: Длительность в секундах.
+        initial_messages: Начальные сообщения для long context (из датасета).
+    """
     try:
         client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=600.0)
         session = StreamSession(client)
 
-        messages = [
-            {"role": "system", "content": "Ты полезный помощник. Отвечай подробно и развёрнуто."}
-        ]
+        is_long_context = initial_messages is not None and len(initial_messages) > 1
 
-        # Сразу сообщаем о старте
-        q.put({"type": "start", "id": worker_id})
+        if is_long_context:
+            # Long context: используем messages из датасета
+            messages: list[dict] = list(initial_messages)  # type: ignore[arg-type]
+            # Помечаем воркер
+            q.put({"type": "start", "id": worker_id, "long_context": True})
+        else:
+            messages = [
+                {"role": "system", "content": "Ты полезный помощник. Отвечай подробно и развёрнуто."}
+            ]
+            q.put({"type": "start", "id": worker_id, "long_context": False})
 
         start_time = time.time()
         call_count = 0
@@ -295,12 +311,13 @@ class LiveTable:
             if v is not None:
                 w[k] = v
 
-    def mark_started(self, worker_id):
+    def mark_started(self, worker_id, long_context=False):
         self.workers[worker_id] = {
             "round": 1, "calls": 0, "prompt": 0, "gen": 0,
             "gen_est": 0, "chunks": 0, "call_gen": 0, "total": 0,
             "speed": 0, "avg": 0, "ttft": 0, "ttft_sum": 0,
             "wall": "", "tail": "[dim]waiting...[/]",
+            "long_context": long_context,
         }
 
     def update_stats(self, msg):
@@ -536,7 +553,7 @@ class LiveTable:
         )
 
         # Колонки с фиксированной шириной
-        table.add_column("ID", width=4, justify="right", style="bold yellow")
+        table.add_column("ID", width=7, justify="right", style="bold yellow")
         table.add_column("Round", width=6, justify="right")
         table.add_column("Calls", width=6, justify="right")
         table.add_column("Prompt", width=12, justify="right")
@@ -586,8 +603,13 @@ class LiveTable:
             ttft = w.get("ttft", 0) or 0
             ttft_sum = w.get("ttft_sum", 0) or 0
 
+            # Маркер long context в ID
+            display_id = wid_str
+            if w.get("long_context"):
+                display_id = f"[LC]{wid_str}"
+
             row = [
-                wid_str,
+                display_id,
                 str(w.get("round", 1)) if w.get("calls", 0) > 0 else "",
                 str(w["calls"]) if w.get("calls", 0) > 0 else "",
                 f"{w['prompt']:>10,}" if w.get("prompt", 0) > 0 else "",
@@ -612,7 +634,18 @@ class LiveTable:
 # Основная функция
 # ---------------------------------------------------------------------------
 
-def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, api_key=None, model=None, max_context=None):
+def run_benchmark(
+    workers=4,
+    duration=None,
+    response_width=60,
+    base_url=None,
+    api_key=None,
+    model=None,
+    max_context=None,
+    long_context_workers=0,
+    data_dir=None,
+    split="100K",
+):
     """Запускает многопроцессный бенчмарк.
 
     Args:
@@ -623,10 +656,40 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
         api_key: Переопределение API_KEY.
         model: Переопределение MODEL.
         max_context: Переопределение MAX_CONTEXT_TOKENS.
+        long_context_workers: Количество воркеров с длинным контекстом.
+        data_dir: Директория с датасетами.
+        split: Сплит BEAM датасета ("100K", "500K", "1M").
     """
     apply_config(base_url=base_url, api_key=api_key, model=model, max_context=max_context)
 
     import llm_speed_benchmark.utils as _u  # noqa: PLC0414
+
+    # Подготовка long context данных
+    long_context_messages = []
+    if long_context_workers > 0:
+        try:
+            from .long_context import LongContextDataset
+            ds_data_dir = data_dir or os.path.expanduser(
+                "~/workspace/data/llm-speed-benchmark/datasets"
+            )
+            ds = LongContextDataset(data_dir=ds_data_dir)
+            ds.load(split=split)
+            for i in range(long_context_workers):
+                conv_count = len(ds.get_conversations_info())
+                msgs = ds.get_messages(
+                    conversation_id=i % conv_count,
+                    max_tokens=_u.MAX_CONTEXT_TOKENS - 1000,
+                )
+                long_context_messages.append(msgs)
+            console = Console()
+            console.print(
+                f"   [cyan]Long context:[/] {long_context_workers} воркер(ов) "
+                f"из split={split}"
+            )
+        except Exception as e:
+            print(f"   Warning: не удалось загрузить long context: {e}")
+            long_context_workers = 0
+            long_context_messages = []
 
     dur_str = f"{duration}с" if duration is not None else "бесконечно (Ctrl+C)"
     print(f"Запуск {workers} воркеров на {dur_str}...")
@@ -652,10 +715,16 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
 
     with Live(live_table, console=console, refresh_per_second=5, screen=True) as live:
         for i in range(workers):
-            p = Process(target=worker, args=(i, q, start_event, duration), name=f"worker-{i}")
+            is_lc = i < long_context_workers
+            initial_msgs = long_context_messages[i] if is_lc else None
+            p = Process(
+                target=worker,
+                args=(i, q, start_event, duration, initial_msgs),
+                name=f"worker-{i}",
+            )
             p.start()
             processes.append(p)
-            console.print(f"   Запущен воркер {i} (pid={p.pid})")
+            console.print(f"   Запущен воркер {i} (pid={p.pid}){' [LC]' if is_lc else ''}")
 
         start_event.set()
         bench_start = time.time()
@@ -668,7 +737,7 @@ def run_benchmark(workers=4, duration=None, response_width=60, base_url=None, ap
                     msg_id = msg["id"]
 
                     if msg_type == "start":
-                        live_table.mark_started(msg_id)
+                        live_table.mark_started(msg_id, msg.get("long_context", False))
                     elif msg_type == "stats":
                         live_table.update_stats(msg)
                     elif msg_type == "live":
@@ -762,6 +831,18 @@ def cli():
         "--response-width", type=int, default=60,
         help="Ширина колонки Response (по умолч. 60)",
     )
+    parser.add_argument(
+        "--long-context-workers", type=int, default=0,
+        help="Количество воркеров с длинным контекстом из BEAM (по умолч. 0)",
+    )
+    parser.add_argument(
+        "--data-dir", type=str, default=None,
+        help="Директория с датасетами (по умолч. ~/workspace/data/llm-speed-benchmark/datasets)",
+    )
+    parser.add_argument(
+        "--split", type=str, default="100K", choices=["100K", "500K", "1M"],
+        help="Сплит BEAM датасета (по умолч. 100K)",
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -772,6 +853,9 @@ def cli():
         api_key=args.api_key,
         model=args.model,
         max_context=args.max_context,
+        long_context_workers=args.long_context_workers,
+        data_dir=args.data_dir,
+        split=args.split,
     )
 
 

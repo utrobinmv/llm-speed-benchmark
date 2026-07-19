@@ -1,295 +1,309 @@
-#!/usr/bin/env python3
 """
 tests/test_long_context.py
 
-Тесты для long_context.py -- LongContextDataset.
+Тесты для модуля long_context.py -- загрузка и подготовка датасетов длинных контекстов.
 """
 
+from __future__ import annotations
+
 import json
-import tempfile
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pandas as pd
 import pytest
 
-from llm_speed_benchmark.long_context import LongContextDataset
+from llm_speed_benchmark.long_context import (
+    ConversationInfo,
+    LongContextDataset,
+    _DEFAULT_DATA_DIR,
+)
 
 
-# ============================================================================
-# LongContextDataset -- инициализация
-# ============================================================================
+@pytest.fixture
+def tmp_data_dir(tmp_path: Path) -> str:
+    """Создаёт временную директорию для тестовых данных."""
+    return str(tmp_path / "datasets")
 
-class TestLongContextInit:
-    """LongContextDataset: инициализация и свойства."""
 
-    def test_default_init(self):
+def _make_chat_array(groups: list[list[dict]]) -> np.ndarray:
+    """Создаёт numpy array of numpy arrays (как в реальном BEAM)."""
+    return np.array(
+        [np.array(group, dtype=object) for group in groups], dtype=object
+    )
+
+
+@pytest.fixture
+def mock_beam_parquet(tmp_data_dir: str):
+    """Мокает pd.read_parquet для возврата тестовых данных BEAM."""
+    beam_dir = Path(tmp_data_dir) / "beam" / "data"
+    beam_dir.mkdir(parents=True, exist_ok=True)
+
+    # Создаём dummy parquet файл чтобы glob нашёл его
+    (beam_dir / "100K-00000-of-00001.parquet").touch()
+
+    chat1 = _make_chat_array([
+        [
+            {"content": "Hello, can you help me?", "role": "user", "id": 0},
+            {"content": "Of course! How can I help?", "role": "assistant", "id": 1},
+        ],
+        [
+            {"content": "Tell me about Python.", "role": "user", "id": 2},
+            {"content": "Python is a programming language.", "role": "assistant", "id": 3},
+        ],
+    ])
+
+    chat2 = _make_chat_array([
+        [
+            {"content": "A" * 3000, "role": "user", "id": 0},
+            {"content": "B" * 3000, "role": "assistant", "id": 1},
+        ],
+    ])
+
+    mock_df = pd.DataFrame([
+        {
+            "conversation_id": 1,
+            "chat": chat1,
+        },
+        {
+            "conversation_id": 2,
+            "chat": chat2,
+        },
+    ])
+
+    with patch("pandas.read_parquet", return_value=mock_df):
+        yield
+
+
+class TestConversationInfo:
+    def test_creation(self) -> None:
+        info = ConversationInfo(
+            conversation_id=1,
+            split="100K",
+            message_count=100,
+            estimated_tokens=50000,
+            char_count=150000,
+        )
+        assert info.conversation_id == 1
+        assert info.split == "100K"
+        assert info.message_count == 100
+        assert info.estimated_tokens == 50000
+
+
+class TestLongContextDatasetInit:
+    def test_defaults(self) -> None:
         ds = LongContextDataset()
         assert ds.dataset_name == "beam"
-        assert not ds.is_downloaded
+        assert ds.data_dir == _DEFAULT_DATA_DIR
 
-    def test_custom_dataset(self):
-        ds = LongContextDataset(dataset_name="longbench-chat")
-        assert ds.dataset_name == "longbench-chat"
+    def test_custom(self) -> None:
+        ds = LongContextDataset(dataset_name="beam", data_dir="/custom/path")
+        assert ds.dataset_name == "beam"
+        assert ds.data_dir == "/custom/path"
 
-    def test_cache_dir_expanded(self, tmp_path):
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        assert ds.cache_dir == tmp_path
+    def test_dataset_path(self) -> None:
+        ds = LongContextDataset(data_dir="/test")
+        assert ds.dataset_path == Path("/test/beam")
 
-    def test_data_dir(self, tmp_path):
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        assert ds.data_dir == tmp_path / "beam"
-
-    def test_is_downloaded_false(self):
-        ds = LongContextDataset()
-        assert not ds.is_downloaded
-
-    def test_is_downloaded_true(self, tmp_path):
-        data_dir = tmp_path / "beam"
-        data_dir.mkdir()
-        (data_dir / "test.json").write_text("[]")
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        assert ds.is_downloaded
+    def test_beam_data_path(self) -> None:
+        ds = LongContextDataset(data_dir="/test")
+        assert ds.beam_data_path == Path("/test/beam/data")
 
 
-# ============================================================================
-# LongContextDataset -- _estimate_text_tokens
-# ============================================================================
+class TestLoadBeam:
+    def test_load_100k(self, mock_beam_parquet, tmp_data_dir: str) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        records = ds.load(split="100K")
+        assert len(records) == 2
+        assert records[0]["conversation_id"] == 1
+        assert records[1]["conversation_id"] == 2
+        assert records[0]["split"] == "100K"
 
-class TestEstimateTokens:
-    """LongContextDataset: оценка токенов."""
+    def test_load_caches(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        r1 = ds.load(split="100K")
+        r2 = ds.load(split="100K")
+        assert r1 is r2
 
-    def test_empty(self):
-        assert LongContextDataset._estimate_text_tokens("") == 0
+    def test_load_reloads_on_split_change(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        ds.load(split="100K")
+        with pytest.raises((ValueError, FileNotFoundError)):
+            ds.load(split="500K")
 
-    def test_short_text(self):
-        tokens = LongContextDataset._estimate_text_tokens("hello")
-        assert tokens >= 1
+    def test_unknown_split(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        with pytest.raises(ValueError, match="Неизвестный split"):
+            ds.load(split="unknown")
 
-    def test_long_text(self):
-        text = "a" * 120  # ~40 токенов
-        tokens = LongContextDataset._estimate_text_tokens(text)
-        assert 35 <= tokens <= 45
-
-    def test_cyrillic(self):
-        tokens = LongContextDataset._estimate_text_tokens("Привет мир")
-        assert tokens >= 1
-
-
-# ============================================================================
-# LongContextDataset -- load с фикстурами
-# ============================================================================
-
-class TestLongContextLoad:
-    """LongContextDataset: загрузка из локальных файлов."""
-
-    def _create_beam_fixture(self, tmp_path):
-        """Создаёт фикстуру BEAM данных."""
-        data_dir = tmp_path / "beam"
-        data_dir.mkdir()
-        records = [
-            {
-                "conversations": [
-                    {"from": "human", "value": "Hello"},
-                    {"from": "gpt", "value": "Hi there"},
-                    {"from": "human", "value": "How are you"},
-                    {"from": "gpt", "value": "I am fine"},
-                ]
-            },
-            {
-                "conversations": [
-                    {"from": "human", "value": "Question one"},
-                    {"from": "gpt", "value": "Answer one"},
-                ]
-            },
-        ]
-        (data_dir / "conv_0.json").write_text(json.dumps(records[0]))
-        (data_dir / "conv_1.json").write_text(json.dumps(records[1]))
-        return data_dir
-
-    def test_load_beam(self, tmp_path):
-        self._create_beam_fixture(tmp_path)
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        data = ds.load()
-        assert len(data) == 2
-
-    def test_load_not_downloaded(self):
-        ds = LongContextDataset()
-        with pytest.raises(FileNotFoundError):
+    def test_not_found(self) -> None:
+        ds = LongContextDataset(data_dir="/nonexistent/path")
+        with pytest.raises(FileNotFoundError, match="не найден"):
             ds.load()
 
-    def test_load_cached(self, tmp_path):
-        self._create_beam_fixture(tmp_path)
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        data1 = ds.load()
-        data2 = ds.load()  # Должен вернуть кэш
-        assert data1 is data2
-
-    def test_unknown_dataset(self, tmp_path):
-        # Создаём пустую директорию чтобы is_downloaded=True
-        data_dir = tmp_path / "unknown"
-        data_dir.mkdir()
-        (data_dir / "dummy.json").write_text("[]")
-        ds = LongContextDataset(dataset_name="unknown", cache_dir=str(tmp_path))
-        with pytest.raises(ValueError):
+    def test_unknown_dataset(self, tmp_data_dir: str) -> None:
+        ds = LongContextDataset(dataset_name="unknown", data_dir=tmp_data_dir)
+        Path(tmp_data_dir, "unknown").mkdir(parents=True)
+        with pytest.raises(ValueError, match="Неизвестный датасет"):
             ds.load()
 
 
-# ============================================================================
-# LongContextDataset -- get_messages
-# ============================================================================
+class TestFlattenChat:
+    def test_flatten_simple(self) -> None:
+        chat = np.array([
+            np.array([
+                {"content": "Hi", "role": "user", "id": 0},
+                {"content": "Hello", "role": "assistant", "id": 1},
+            ]),
+        ])
+        result = LongContextDataset._flatten_chat(chat)
+        assert len(result) == 2
+        assert result[0] == {"role": "user", "content": "Hi"}
+        assert result[1] == {"role": "assistant", "content": "Hello"}
 
-class TestLongContextMessages:
-    """LongContextDataset: преобразование в OpenAI messages."""
+    def test_flatten_multiple_groups(self) -> None:
+        chat = np.array([
+            np.array([
+                {"content": "msg1", "role": "user", "id": 0},
+                {"content": "msg2", "role": "assistant", "id": 1},
+            ]),
+            np.array([
+                {"content": "msg3", "role": "user", "id": 2},
+                {"content": "msg4", "role": "assistant", "id": 3},
+            ]),
+        ])
+        result = LongContextDataset._flatten_chat(chat)
+        assert len(result) == 4
+        assert [m["content"] for m in result] == ["msg1", "msg2", "msg3", "msg4"]
 
-    def _create_beam_fixture(self, tmp_path):
-        data_dir = tmp_path / "beam"
-        data_dir.mkdir()
-        records = [
-            {
-                "conversations": [
-                    {"from": "human", "value": "Hello world"},
-                    {"from": "gpt", "value": "Hi there friend"},
-                    {"from": "human", "value": "Tell me more"},
-                    {"from": "gpt", "value": "Sure thing"},
-                ]
-            },
-        ]
-        (data_dir / "conv_0.json").write_text(json.dumps(records[0]))
-        return data_dir
+    def test_flatten_defaults_role(self) -> None:
+        chat = np.array([
+            np.array([
+                {"content": "no role", "id": 0},
+            ]),
+        ])
+        result = LongContextDataset._flatten_chat(chat)
+        assert result[0]["role"] == "user"
 
-    def test_beam_to_messages(self, tmp_path):
-        self._create_beam_fixture(tmp_path)
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        messages = ds.get_messages(conversation_id=0)
-        assert messages[0]["role"] == "system"
-        # После system: human -> user, gpt -> assistant
-        assert messages[1]["role"] == "user"
-        assert messages[1]["content"] == "Hello world"
-        assert messages[2]["role"] == "assistant"
-        assert messages[2]["content"] == "Hi there friend"
 
-    def test_beam_to_messages_roles(self, tmp_path):
-        self._create_beam_fixture(tmp_path)
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        messages = ds.get_messages(conversation_id=0)
-        roles = [m["role"] for m in messages]
-        assert "system" in roles
-        assert "user" in roles
-        assert "assistant" in roles
+class TestBuildInfo:
+    def test_info_built_after_load(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        ds.load(split="100K")
+        info = ds.get_conversations_info()
+        assert len(info) == 2
+        assert info[0].conversation_id == 1
+        assert info[0].split == "100K"
+        # First conversation has 4 messages (2 groups x 2)
+        assert info[0].message_count == 4
+        # Second has 2 messages
+        assert info[1].message_count == 2
 
-    def test_out_of_range(self, tmp_path):
-        self._create_beam_fixture(tmp_path)
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        with pytest.raises(IndexError):
+
+class TestGetFilteredConversations:
+    def test_filter_by_tokens(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        ds.load(split="100K")
+        # First conversation: ~40 chars / 3 = ~13 tokens
+        # Second: ~6000 chars / 3 = ~2000 tokens
+        filtered = ds.get_filtered_conversations(min_tokens=100, max_tokens=5000)
+        assert len(filtered) == 1
+        assert filtered[0].conversation_id == 2
+
+    def test_filter_count_limit(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        ds.load(split="100K")
+        filtered = ds.get_filtered_conversations(
+            min_tokens=0, max_tokens=10000, count=1
+        )
+        assert len(filtered) == 1
+
+
+class TestGetMessages:
+    def test_basic_messages(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        ds.load(split="100K")
+        msgs = ds.get_messages(conversation_id=0, max_tokens=100000)
+        # system + 4 messages
+        assert len(msgs) == 5
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "user"
+        assert msgs[1]["content"] == "Hello, can you help me?"
+
+    def test_truncation(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        ds.load(split="100K")
+        # Very small max_tokens -- should truncate
+        msgs = ds.get_messages(conversation_id=1, max_tokens=5)
+        # Should keep system + at least 1 message
+        assert len(msgs) >= 2
+        assert msgs[0]["role"] == "system"
+
+    def test_invalid_conversation_id(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        ds.load(split="100K")
+        with pytest.raises(IndexError, match="вне диапазона"):
             ds.get_messages(conversation_id=99)
 
-    def test_max_tokens_truncation(self, tmp_path):
-        data_dir = tmp_path / "beam"
-        data_dir.mkdir()
-        # Создаём длинную conversation
-        convs = []
-        for i in range(100):
-            convs.append({"from": "human", "value": f"Message number {i} with some text"})
-            convs.append({"from": "gpt", "value": f"Response number {i} with more text"})
-        records = [{"conversations": convs}]
-        (data_dir / "long.json").write_text(json.dumps(records[0]))
-
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        messages = ds.get_messages(conversation_id=0, max_tokens=50)
-        # Должно быть обрезано -- меньше 100 сообщений
-        assert len(messages) < 100
-        # Но минимум system + 1
-        assert len(messages) >= 2
+    def test_negative_conversation_id(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        ds.load(split="100K")
+        with pytest.raises(IndexError):
+            ds.get_messages(conversation_id=-1)
 
 
-# ============================================================================
-# LongContextDataset -- get_conversations
-# ============================================================================
+class TestEstimateTokens:
+    def test_empty(self) -> None:
+        assert LongContextDataset._estimate_text_tokens("") == 0
 
-class TestLongContextFilter:
-    """LongContextDataset: фильтрация по длине."""
+    def test_short(self) -> None:
+        assert LongContextDataset._estimate_text_tokens("hi") == 1
 
-    def test_filter_by_tokens(self, tmp_path):
-        data_dir = tmp_path / "beam"
-        data_dir.mkdir()
-        # Короткая conversation (~5 токенов)
-        short = {"conversations": [{"from": "human", "value": "Hi"}, {"from": "gpt", "value": "Ok"}]}
-        # Длинная conversation (~50 токенов)
-        long_text = " ".join([f"word{i}" for i in range(150)])
-        long = {"conversations": [{"from": "human", "value": long_text}]}
-        (data_dir / "short.json").write_text(json.dumps(short))
-        (data_dir / "long.json").write_text(json.dumps(long))
-
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        # Фильтр 50-500 токенов -- должна попасть длинная conversation
-        filtered = ds.get_conversations(min_tokens=50, max_tokens=500)
-        assert len(filtered) >= 1
-        for f in filtered:
-            assert 50 <= f["estimated_tokens"] <= 500
+    def test_longer(self) -> None:
+        est = LongContextDataset._estimate_text_tokens("Hello world! " * 100)
+        assert est > 0
+        assert est == len("Hello world! " * 100) // 3
 
 
-# ============================================================================
-# LongContextDataset -- info()
-# ============================================================================
+class TestSummary:
+    def test_not_available(self) -> None:
+        ds = LongContextDataset(data_dir="/nonexistent")
+        summary = ds.summary()
+        assert summary["available"] is False
+        assert summary["dataset"] == "beam"
 
-class TestLongContextInfo:
-    """LongContextDataset: info()."""
-
-    def test_info_not_downloaded(self):
-        ds = LongContextDataset()
-        info = ds.info()
-        assert info["dataset"] == "beam"
-        assert info["downloaded"] is False
-
-    def test_info_downloaded(self, tmp_path):
-        data_dir = tmp_path / "beam"
-        data_dir.mkdir()
-        record = {"conversations": [{"from": "human", "value": "Hello world test"}]}
-        (data_dir / "conv.json").write_text(json.dumps(record))
-
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        info = ds.info()
-        assert info["downloaded"] is True
-        assert info["records"] == 1
-        assert "min_tokens" in info
-        assert "max_tokens" in info
-        assert "avg_tokens" in info
-
-
-# ============================================================================
-# LongContextDataset -- download (моки)
-# ============================================================================
-
-class TestLongContextDownload:
-    """LongContextDataset: download() с моками."""
-
-    def test_download_beam_already_exists(self, tmp_path, capsys):
-        data_dir = tmp_path / "beam"
-        data_dir.mkdir()
-        (data_dir / "existing.json").write_text("[]")
-        ds = LongContextDataset(cache_dir=str(tmp_path))
-        ds.download()
-        captured = capsys.readouterr()
-        assert "уже скачан" in captured.out
-
-    def test_download_unknown_dataset(self):
-        ds = LongContextDataset(dataset_name="unknown")
-        with pytest.raises(ValueError):
-            ds.download()
-
-    def test_download_beam_success(self, tmp_path):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="done")
-            ds = LongContextDataset(cache_dir=str(tmp_path))
-            ds.download()
-            mock_run.assert_called_once()
-            # Проверяем, что в команде есть repo_id
-            call_args = mock_run.call_args[0][0]
-            assert "Mohammadta/BEAM" in call_args
-
-    def test_download_beam_failure(self, tmp_path):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stderr="auth failed", stdout="")
-            ds = LongContextDataset(cache_dir=str(tmp_path))
-            with pytest.raises(RuntimeError, match="auth failed"):
-                ds.download()
+    def test_available_with_data(
+        self, mock_beam_parquet, tmp_data_dir: str
+    ) -> None:
+        ds = LongContextDataset(data_dir=tmp_data_dir)
+        ds.load(split="100K")
+        summary = ds.summary()
+        assert summary["available"] is True
+        assert summary["records"] == 2
+        assert summary["split"] == "100K"
+        assert "min_tokens" in summary
+        assert "max_tokens" in summary
+        assert "avg_tokens" in summary
+        assert "total_messages" in summary

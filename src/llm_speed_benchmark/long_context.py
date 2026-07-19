@@ -3,205 +3,224 @@ llm_speed_benchmark/long_context.py
 
 Загрузка и подготовка датасетов длинных контекстов для бенчмарка.
 
+Датасеты хранятся в ~/workspace/data/llm-speed-benchmark/datasets/
+и должны быть скачаны заранее (см. DATA.md).
+
 Поддерживаемые датасеты:
-- BEAM (Mohammadta/BEAM) -- multi-turn conversations 128K-10M токенов
-- LongBench-Chat -- реальные разговоры 10K-100K токенов
+- BEAM (Mohammadta/BEAM) -- multi-turn conversations 128K-2.4M токенов
 
 Использование:
     from llm_speed_benchmark.long_context import LongContextDataset
 
-    dataset = LongContextDataset(dataset_name="beam", cache_dir="~/.llm-speed-benchmark/data")
-    dataset.download()
+    dataset = LongContextDataset(
+        dataset_name="beam",
+        data_dir="/home/user/workspace/data/llm-speed-benchmark/datasets",
+    )
+    dataset.load(split="100K")
 
-    # Получить длинные сообщения для воркера
-    messages = dataset.get_messages(conversation_id=0, max_tokens=128000)
+    # Получить сообщения для воркера (обрезка до 128K токенов)
+    messages = dataset.get_messages(conversation_id=0, max_tokens=128_000)
 """
 
 from __future__ import annotations
 
-import json
 import os
-import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
 
+# Default data directory
+_DEFAULT_DATA_DIR = os.path.expanduser(
+    "~/workspace/data/llm-speed-benchmark/datasets"
+)
+
+# BEAM splits and their parquet file patterns
+BEAM_SPLITS = {
+    "100K": "100K-*.parquet",
+    "500K": "500K-*.parquet",
+    "1M": "1M-*.parquet",
+}
+
+
+@dataclass
+class ConversationInfo:
+    """Информация о conversation из датасета."""
+
+    conversation_id: int
+    split: str
+    message_count: int
+    estimated_tokens: int
+    char_count: int
+
+
+@dataclass
 class LongContextDataset:
     """Загрузка и подготовка датасетов длинных контекстов.
 
     Args:
-        dataset_name: Название датасета ("beam", "longbench-chat").
-        cache_dir: Директория для кэширования скачанных данных.
-        hf_token: HuggingFace token для доступа к gated датасетам.
+        dataset_name: Название датасета ("beam").
+        data_dir: Директория с заранее скачанными данными.
     """
 
-    def __init__(
-        self,
-        dataset_name: str = "beam",
-        cache_dir: str = "~/.llm-speed-benchmark/data",
-        hf_token: Optional[str] = None,
-    ) -> None:
-        self.dataset_name = dataset_name.lower()
-        self.cache_dir = Path(os.path.expanduser(cache_dir))
-        self.hf_token = hf_token
-        self._data: Optional[list[dict]] = None
+    dataset_name: str = "beam"
+    data_dir: str = _DEFAULT_DATA_DIR
+    _conversations: Optional[list[dict]] = field(default=None, repr=False)
+    _split: str = field(default="", repr=False)
+    _info: list[ConversationInfo] = field(default_factory=list, repr=False)
 
     @property
-    def data_dir(self) -> Path:
+    def dataset_path(self) -> Path:
         """Путь к директории с данными датасета."""
-        return self.cache_dir / self.dataset_name
+        return Path(self.data_dir) / self.dataset_name
 
     @property
-    def is_downloaded(self) -> bool:
-        """Проверяет, скачан ли датасет."""
-        return self.data_dir.exists() and any(self.data_dir.iterdir())
+    def beam_data_path(self) -> Path:
+        """Путь к data/ внутри BEAM."""
+        return self.dataset_path / "data"
 
-    def download(self) -> None:
-        """Скачивает датасет из HuggingFace Hub.
+    @property
+    def is_available(self) -> bool:
+        """Проверяет, есть ли данные на диске."""
+        return self.dataset_path.exists()
 
-        Использует `huggingface-cli download` для скачивания.
-        Для gated датасетов требуется HF_TOKEN.
-        """
-        if self.is_downloaded:
-            print(f"  Датасет {self.dataset_name} уже скачан: {self.data_dir}")
-            return
+    def load(self, split: str = "100K") -> list[dict]:
+        """Загружает данные из локальной директории.
 
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-        if self.dataset_name == "beam":
-            self._download_beam()
-        elif self.dataset_name == "longbench-chat":
-            self._download_longbench_chat()
-        else:
-            raise ValueError(f"Неизвестный датасет: {self.dataset_name}. Доступные: beam, longbench-chat")
-
-    def _download_beam(self) -> None:
-        """Скачивает BEAM dataset с HuggingFace."""
-        import subprocess
-
-        repo_id = "Mohammadta/BEAM"
-        cmd = [
-            "huggingface-cli", "download",
-            "--repo-type", "dataset",
-            repo_id,
-            "--local-dir", str(self.data_dir),
-        ]
-        if self.hf_token:
-            cmd.extend(["--token", self.hf_token])
-
-        print(f"  Скачивание BEAM dataset...")
-        print(f"  {subprocess.list2cmdline(cmd)}")
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  Ошибка скачивания: {result.stderr}")
-            raise RuntimeError(f"Не удалось скачать BEAM dataset: {result.stderr}")
-
-        print(f"  BEAM dataset скачан в {self.data_dir}")
-
-    def _download_longbench_chat(self) -> None:
-        """Скачивает LongBench-Chat dataset."""
-        import subprocess
-
-        # LongBench-Chat доступен как часть LongBench
-        repo_id = "gmlwns2000/LongBench-hip"
-        cmd = [
-            "huggingface-cli", "download",
-            "--repo-type", "dataset",
-            repo_id,
-            "--local-dir", str(self.data_dir),
-        ]
-        if self.hf_token:
-            cmd.extend(["--token", self.hf_token])
-
-        print(f"  Скачивание LongBench-Chat dataset...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  Ошибка скачивания: {result.stderr}")
-            raise RuntimeError(f"Не удалось скачать LongBench-Chat: {result.stderr}")
-
-        print(f"  LongBench-Chat скачан в {self.data_dir}")
-
-    def load(self) -> list[dict]:
-        """Загружает данные из локального кэша.
+        Args:
+            split: Сплит датасета ("100K", "500K", "1M").
 
         Returns:
-            Список словарей с данными датасета.
-        """
-        if self._data is not None:
-            return self._data
+            Список raw записей (dict с колонками parquet).
 
-        if not self.is_downloaded:
+        Raises:
+            FileNotFoundError: если данные не найдены.
+            ValueError: если split неизвестен.
+        """
+        if self._conversations is not None and self._split == split:
+            return self._conversations
+
+        if not self.is_available:
             raise FileNotFoundError(
-                f"Датасет {self.dataset_name} не скачан. Вызовите download() или --download."
+                f"Датасет {self.dataset_name} не найден: {self.dataset_path}\n"
+                f"Скачайте заранее: hf download --repo-type dataset Mohammadta/BEAM --local-dir {self.dataset_path}"
             )
 
         if self.dataset_name == "beam":
-            self._data = self._load_beam()
-        elif self.dataset_name == "longbench-chat":
-            self._data = self._load_longbench_chat()
+            self._conversations = self._load_beam(split)
         else:
-            raise ValueError(f"Неизвестный датасет: {self.dataset_name}")
+            raise ValueError(
+                f"Неизвестный датасет: {self.dataset_name}. Доступные: beam"
+            )
 
-        print(f"  Загружено {len(self._data)} записей из {self.dataset_name}")
-        return self._data
+        self._split = split
+        self._build_info()
+        return self._conversations
 
-    def _load_beam(self) -> list[dict]:
-        """Загружает BEAM данные.
+    def _load_beam(self, split: str) -> list[dict]:
+        """Загружает BEAM данные из parquet файлов.
 
-        BEAM содержит JSON файлы с conversations.
-        Каждый файл -- одна conversation с метаданными.
+        BEAM содержит parquet файлы по сплитам:
+        - 100K: 20 conversations, ~133K-300K токенов
+        - 500K: 35 conversations, ~430K-1.1M токенов
+        - 1M: 35 conversations, ~947K-2.4M токенов
+
+        Структура chat колонки: numpy array of numpy arrays,
+        каждый внутренний массив -- группа сообщений (turn)
+        с dict {content, role, id, ...}.
         """
+        if split not in BEAM_SPLITS:
+            raise ValueError(
+                f"Неизвестный split '{split}' для BEAM. "
+                f"Доступные: {', '.join(sorted(BEAM_SPLITS))}"
+            )
+
+        pattern = BEAM_SPLITS[split]
+        parquet_files = sorted(self.beam_data_path.glob(pattern))
+        if not parquet_files:
+            raise FileNotFoundError(
+                f"Не найдены parquet файлы для split={split}: "
+                f"{self.beam_data_path}/{pattern}"
+            )
+
         records = []
-        for json_file in sorted(self.data_dir.glob("*.json")):
-            with open(json_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # BEAM может быть списком или словарём
-            if isinstance(data, list):
-                records.extend(data)
-            elif isinstance(data, dict):
-                records.append(data)
+        for pq_file in parquet_files:
+            df = pd.read_parquet(pq_file)
+            for idx in range(len(df)):
+                row = df.iloc[idx]
+                records.append({
+                    "conversation_id": int(row["conversation_id"]),
+                    "chat": row["chat"],  # numpy array of numpy arrays
+                    "split": split,
+                })
+
         return records
 
-    def _load_longbench_chat(self) -> list[dict]:
-        """Загружает LongBench-Chat данные."""
-        records = []
-        for json_file in sorted(self.data_dir.glob("*.json")):
-            with open(json_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                records.extend(data)
-            elif isinstance(data, dict):
-                records.append(data)
-        return records
+    def _build_info(self) -> None:
+        """Собирает статистику по всем conversation."""
+        assert self._conversations is not None
+        self._info = []
+        for record in self._conversations:
+            msgs = self._flatten_chat(record["chat"])
+            char_count = sum(len(m["content"]) for m in msgs)
+            self._info.append(
+                ConversationInfo(
+                    conversation_id=record["conversation_id"],
+                    split=record["split"],
+                    message_count=len(msgs),
+                    estimated_tokens=char_count // 3,
+                    char_count=char_count,
+                )
+            )
 
-    def get_conversations(
+    @staticmethod
+    def _flatten_chat(chat_array) -> list[dict]:
+        """Распаковывает chat (numpy array of numpy arrays) в плоский список.
+
+        Каждый внутренний numpy array -- это группа сообщений (turn).
+        Каждый элемент группы -- dict с полями content, role, id, ...
+        """
+        result: list[dict] = []
+        for group in chat_array:
+            for entry in group:
+                if isinstance(entry, dict):
+                    result.append({
+                        "role": entry.get("role", "user"),
+                        "content": entry.get("content", ""),
+                    })
+        return result
+
+    def get_conversations_info(self) -> list[ConversationInfo]:
+        """Возвращает информацию о всех загруженных conversation."""
+        if self._info:
+            return self._info
+        self.load()
+        return self._info
+
+    def get_filtered_conversations(
         self,
         min_tokens: int = 50_000,
-        max_tokens: int = 200_000,
-        count: int = 10,
-    ) -> list[dict]:
+        max_tokens: int = 300_000,
+        count: Optional[int] = None,
+    ) -> list[ConversationInfo]:
         """Фильтрует conversation по длине в токенах.
 
         Args:
             min_tokens: Минимальная длина conversation.
             max_tokens: Максимальная длина conversation.
-            count: Максимальное количество conversation.
+            count: Максимальное количество conversation. None = все.
 
         Returns:
-            Список conversation, отфильтрованных по длине.
+            Список ConversationInfo, отфильтрованных по длине.
         """
-        data = self.load()
-        filtered = []
-        for record in data:
-            tokens = self._estimate_tokens(record)
-            if min_tokens <= tokens <= max_tokens:
-                filtered.append({
-                    "record": record,
-                    "estimated_tokens": tokens,
-                })
-                if len(filtered) >= count:
-                    break
+        info_list = self.get_conversations_info()
+        filtered = [
+            ci for ci in info_list
+            if min_tokens <= ci.estimated_tokens <= max_tokens
+        ]
+        if count is not None:
+            filtered = filtered[:count]
         return filtered
 
     def get_messages(
@@ -212,132 +231,88 @@ class LongContextDataset:
         """Преобразует запись датасета в список сообщений для API.
 
         Args:
-            conversation_id: Индекс conversation в датасете.
+            conversation_id: Индекс conversation в загруженном сплите.
             max_tokens: Максимальное количество токенов (обрезка).
 
         Returns:
             Список сообщений в формате OpenAI API.
+
+        Raises:
+            IndexError: если conversation_id вне диапазона.
         """
         data = self.load()
-        if conversation_id >= len(data):
+        if conversation_id < 0 or conversation_id >= len(data):
             raise IndexError(
-                f"conversation_id={conversation_id}超出范围 (всего {len(data)} записей)"
+                f"conversation_id={conversation_id} вне диапазона "
+                f"(всего {len(data)} записей в split={self._split})"
             )
 
         record = data[conversation_id]
-        messages = self._record_to_messages(record)
-
-        # Обрезка до max_tokens (приблизительно)
-        if messages:
-            total_est = sum(self._estimate_text_tokens(m.get("content", "")) for m in messages)
-            while total_est > max_tokens and len(messages) > 2:
-                messages.pop(1)  # Удаляем самые старые (после system)
-                total_est = sum(
-                    self._estimate_text_tokens(m.get("content", ""))
-                    for m in messages
-                )
-
+        messages = self._beam_to_messages(record, max_tokens)
         return messages
 
-    def _record_to_messages(self, record: dict) -> list[dict]:
-        """Преобразует запись датасета в формат сообщений OpenAI."""
-        if self.dataset_name == "beam":
-            return self._beam_to_messages(record)
-        elif self.dataset_name == "longbench-chat":
-            return self._longbench_to_messages(record)
-        else:
-            # Generic: ищем поле 'conversations' или 'messages'
-            conversations = record.get("conversations") or record.get("messages") or []
-            messages = [{"role": "system", "content": "Ты полезный помощник."}]
-            for conv in conversations:
-                if isinstance(conv, dict):
-                    role = conv.get("role", "user")
-                    content = conv.get("content", "")
-                    if content:
-                        messages.append({"role": role, "content": content})
-                elif isinstance(conv, str):
-                    messages.append({"role": "user", "content": conv})
-            return messages
+    def _beam_to_messages(
+        self, record: dict, max_tokens: int
+    ) -> list[dict]:
+        """BEAM -> OpenAI messages с обрезкой до max_tokens.
 
-    def _beam_to_messages(self, record: dict) -> list[dict]:
-        """BEAM -> OpenAI messages."""
-        messages = [{"role": "system", "content": "Ты полезный помощник."}]
+        Берёт сообщения из chat, добавляет system prompt,
+        и обрезает до max_tokens, удаляя самые старые сообщения.
+        """
+        flat_msgs = self._flatten_chat(record["chat"])
 
-        # BEAM format: conversations = [{"from": "human"/"gpt", "value": "..."}]
-        conversations = record.get("conversations") or record.get("dialogue") or []
-        for conv in conversations:
-            if isinstance(conv, dict):
-                role_map = {"human": "user", "gpt": "assistant", "user": "user", "assistant": "assistant"}
-                role = role_map.get(conv.get("from", ""), "user")
-                content = conv.get("value") or conv.get("content", "")
-                if content:
-                    messages.append({"role": role, "content": content})
+        messages: list[dict] = [
+            {"role": "system", "content": "You are a helpful assistant."}
+        ]
+        messages.extend(flat_msgs)
+
+        # Обрезка до max_tokens -- удаляем самые старые (после system)
+        total_est = sum(
+            self._estimate_text_tokens(m.get("content", "")) for m in messages
+        )
+        while total_est > max_tokens and len(messages) > 2:
+            messages.pop(1)  # Удаляем после system
+            total_est = sum(
+                self._estimate_text_tokens(m.get("content", ""))
+                for m in messages
+            )
 
         return messages
-
-    def _longbench_to_messages(self, record: dict) -> list[dict]:
-        """LongBench-Chat -> OpenAI messages."""
-        messages = [{"role": "system", "content": "Ты полезный помощник."}]
-
-        conversations = record.get("conversations") or record.get("messages") or []
-        for conv in conversations:
-            if isinstance(conv, dict):
-                role = conv.get("role", "user")
-                content = conv.get("content", "")
-                if content:
-                    messages.append({"role": role, "content": content})
-
-        return messages
-
-    def _estimate_tokens(self, record: dict) -> int:
-        """Оценивает количество токенов в записи."""
-        conversations = record.get("conversations") or record.get("dialogue") or record.get("messages") or []
-        total = 0
-        for conv in conversations:
-            if isinstance(conv, dict):
-                text = conv.get("value") or conv.get("content", "")
-            elif isinstance(conv, str):
-                text = conv
-            else:
-                continue
-            total += self._estimate_text_tokens(str(text))
-        return total
 
     @staticmethod
     def _estimate_text_tokens(text: str) -> int:
-        """Примерная оценка токенов в тексте (1 токен ~ 4 символа для английского)."""
+        """Примерная оценка токенов в тексте."""
         if not text:
             return 0
-        # Грубая оценка: ~4 chars per token для английского, ~1.5 для кириллицы
-        # Используем 3.5 как среднее
         return max(1, len(text) // 3)
 
-    def info(self) -> dict:
-        """Возвращает информацию о датасете."""
-        if not self.is_downloaded:
+    def summary(self) -> dict:
+        """Возвращает сводку по датасету."""
+        if not self.is_available:
             return {
                 "dataset": self.dataset_name,
-                "downloaded": False,
-                "cache_dir": str(self.data_dir),
+                "available": False,
+                "data_dir": str(self.dataset_path),
             }
 
-        data = self.load()
-        if not data:
+        info_list = self.get_conversations_info()
+        if not info_list:
             return {
                 "dataset": self.dataset_name,
-                "downloaded": True,
+                "available": True,
                 "records": 0,
-                "cache_dir": str(self.data_dir),
+                "data_dir": str(self.dataset_path),
             }
 
-        # Статистика по длине
-        lengths = [self._estimate_tokens(r) for r in data]
+        tokens = [ci.estimated_tokens for ci in info_list]
         return {
             "dataset": self.dataset_name,
-            "downloaded": True,
-            "records": len(data),
-            "min_tokens": min(lengths) if lengths else 0,
-            "max_tokens": max(lengths) if lengths else 0,
-            "avg_tokens": sum(lengths) // len(lengths) if lengths else 0,
-            "cache_dir": str(self.data_dir),
+            "available": True,
+            "split": self._split,
+            "records": len(info_list),
+            "min_tokens": min(tokens),
+            "max_tokens": max(tokens),
+            "avg_tokens": sum(tokens) // len(tokens),
+            "total_messages": sum(ci.message_count for ci in info_list),
+            "data_dir": str(self.dataset_path),
         }
