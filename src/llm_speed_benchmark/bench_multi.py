@@ -664,6 +664,21 @@ def run_benchmark(
 
     import llm_speed_benchmark.utils as _u  # noqa: PLC0414
 
+    # Проверяем реальный контекст модели через API
+    if long_context_workers > 0:
+        try:
+            _detect_client = _u.get_client()
+            actual_context = _u.detect_model_context_length(_detect_client, _u.MODEL)
+            if actual_context < _u.MAX_CONTEXT_TOKENS:
+                print()
+                print(f"   ОШИБКА: модель {_u.MODEL} поддерживает контекст {actual_context:,} токенов,")
+                print(f"   а в настройках указано MAX_CONTEXT_TOKENS={_u.MAX_CONTEXT_TOKENS:,}.")
+                print(f"   Уменьшите MAX_CONTEXT_TOKENS в .env или передайте --max-context {actual_context}.")
+                print()
+                sys.exit(1)
+        except Exception as e:
+            print(f"   Warning: не удалось определить контекст модели: {e}")
+
     # Подготовка long context данных
     long_context_messages = []
     if long_context_workers > 0:
