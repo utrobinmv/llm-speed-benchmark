@@ -35,6 +35,30 @@ def get_client():
     return OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=600.0)
 
 
+def detect_model_context_length(client: OpenAI, model: str) -> int:
+    """Определяет реальную длину контекста модели через API.
+
+    Пробует client.models.retrieve() для получения max_model_len
+    (работает с SGLang/vLLM). Если не удалось — возвращает MAX_CONTEXT_TOKENS.
+
+    Args:
+        client: OpenAI-совместимый клиент.
+        model: Название модели.
+
+    Returns:
+        Реальная длина контекста модели в токенах.
+    """
+    try:
+        model_info = client.models.retrieve(model)
+        max_len = getattr(model_info, "max_model_len", None)
+        if max_len is not None and isinstance(max_len, int) and max_len > 0:
+            return max_len
+    except Exception:
+        pass
+
+    return MAX_CONTEXT_TOKENS
+
+
 def truncate_history(messages):
     """Удаляем самые старые пары user/assistant, оставляем system."""
     result = list(messages)

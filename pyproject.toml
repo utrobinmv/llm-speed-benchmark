@@ -33,6 +33,10 @@ dev = [
     "mypy>=1.0.0",
     "pytest>=7.0.0",
 ]
+long-context = [
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+]
 
 [project.scripts]
 bench_single = "llm_speed_benchmark.bench_single:cli"
