@@ -97,10 +97,14 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
             last_tick = time.time()
 
             # === Streaming через StreamSession ===
-            metrics = session.run(
-                messages=messages,
-                model=_u.MODEL,
-            )
+            try:
+                metrics = session.run(
+                    messages=messages,
+                    model=_u.MODEL,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"\r\033[2KCall {turn:>3} | [red]Ошибка: {e}[/red]")
+                raise
 
             completion_tokens = metrics.completion_tokens
             history_tokens = metrics.prompt_tokens

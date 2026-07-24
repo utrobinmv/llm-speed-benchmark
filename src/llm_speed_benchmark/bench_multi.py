@@ -45,6 +45,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
     start_event: "Event",
     duration: int | None,
     initial_messages: list[dict] | None = None,
+    skip_errors: bool = False,
 ) -> None:
     """Запускает цикл вызовов LLM в отдельном процессе.
 
@@ -54,6 +55,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
         start_event: Event для синхронизации старта.
         duration: Длительность в секундах.
         initial_messages: Начальные сообщения для long context (из датасета).
+        skip_errors: Если True — продолжать после ошибки.
     """
     try:
         client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=600.0)
@@ -181,7 +183,16 @@ def worker(  # type: ignore[reportInvalidTypeForm]
 
                 assistant_content = metrics.assistant_content
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
+                q.put({
+                    "type": "error_stop",
+                    "id": worker_id,
+                    "error": str(e),
+                    "calls": call_count,
+                    "wall": format_time(time.time() - start_time),
+                })
+                if not skip_errors:
+                    break
                 assistant_content = f"[red]Error: {e}[/]"
 
             if assistant_content and not assistant_content.startswith("[red]Error:"):
@@ -361,6 +372,12 @@ class LiveTable:
 
     def mark_error(self, worker_id, traceback_str):
         self._errors[worker_id] = traceback_str
+
+    def mark_stopped(self, worker_id, error_msg):
+        """Воркер остановлен из-за ошибки."""
+        w = self.workers.setdefault(worker_id, {})
+        w["stopped"] = True
+        w["error"] = error_msg
 
     def _clean_tail(self, tail):
         """Очищает и обрезает текст ответа для колонки Response.
@@ -645,6 +662,7 @@ def run_benchmark(
     long_context_workers=0,
     data_dir=None,
     split="100K",
+    skip_errors=False,
 ):
     """Запускает многопроцессный бенчмарк.
 
@@ -659,6 +677,7 @@ def run_benchmark(
         long_context_workers: Количество воркеров с длинным контекстом.
         data_dir: Директория с датасетами.
         split: Сплит BEAM датасета ("100K", "500K", "1M").
+        skip_errors: Если True — продолжать после ошибки.
     """
     apply_config(base_url=base_url, api_key=api_key, model=model, max_context=max_context)
 
@@ -727,45 +746,53 @@ def run_benchmark(
     signal.signal(signal.SIGINT, sigint_handler)
 
     live_table = LiveTable(duration, workers, response_width)
+    live = Live(live_table, console=console, refresh_per_second=5)
+    live.start()
 
-    with Live(live_table, console=console, refresh_per_second=5, screen=True) as live:
-        for i in range(workers):
-            is_lc = i < long_context_workers
-            initial_msgs = long_context_messages[i] if is_lc else None
-            p = Process(
-                target=worker,
-                args=(i, q, start_event, duration, initial_msgs),
-                name=f"worker-{i}",
-            )
-            p.start()
-            processes.append(p)
-            console.print(f"   Запущен воркер {i} (pid={p.pid}){' [LC]' if is_lc else ''}")
+    for i in range(workers):
+        is_lc = i < long_context_workers
+        initial_msgs = long_context_messages[i] if is_lc else None
+        p = Process(
+            target=worker,
+            args=(i, q, start_event, duration, initial_msgs, skip_errors),
+            name=f"worker-{i}",
+        )
+        p.start()
+        processes.append(p)
+        console.print(f"   Запущен воркер {i} (pid={p.pid}){' [LC]' if is_lc else ''}")
 
-        start_event.set()
-        bench_start = time.time()
+    start_event.set()
+    bench_start = time.time()
 
-        try:
-            while duration is None or (time.time() - bench_start < duration + 2):
-                try:
-                    msg = q.get(timeout=0.1)
-                    msg_type = msg["type"]
-                    msg_id = msg["id"]
+    try:
+        while duration is None or (time.time() - bench_start < duration + 2):
+            try:
+                msg = q.get(timeout=0.1)
+                msg_type = msg["type"]
+                msg_id = msg["id"]
 
-                    if msg_type == "start":
-                        live_table.mark_started(msg_id, msg.get("long_context", False))
-                    elif msg_type == "stats":
-                        live_table.update_stats(msg)
-                    elif msg_type == "live":
-                        live_table.update_live(msg)
-                    elif msg_type == "time":
-                        live_table.update_time(msg)
-                    elif msg_type == "error":
-                        live_table.mark_error(msg_id, msg["traceback"])
-                        console.print(f"[red] Воркер {msg_id} упал: {msg.get('traceback', 'unknown error')[:100]}[/]")
-                except Exception:
-                    pass
-        except KeyboardInterrupt:
-            sigint_handler(None, None)
+                if msg_type == "start":
+                    live_table.mark_started(msg_id, msg.get("long_context", False))
+                elif msg_type == "stats":
+                    live_table.update_stats(msg)
+                elif msg_type == "live":
+                    live_table.update_live(msg)
+                elif msg_type == "time":
+                    live_table.update_time(msg)
+                elif msg_type == "error":
+                    live_table.mark_error(msg_id, msg["traceback"])
+                    console.print(f"[red] Воркер {msg_id} упал: {msg.get('traceback', 'unknown error')[:100]}[/]")
+                elif msg_type == "error_stop":
+                    live_table.mark_stopped(msg_id, msg.get("error", "unknown"))
+                    console.print(f"[red] Воркер {msg_id} остановлен: {msg.get('error', 'unknown')[:100]}[/]")
+
+                live.update(live_table)
+            except Exception:
+                pass
+    except KeyboardInterrupt:
+        sigint_handler(None, None)
+
+    live.stop()
 
     # --- Итоги ---
     console.clear()
@@ -858,6 +885,10 @@ def cli():
         "--split", type=str, default="100K", choices=["100K", "500K", "1M"],
         help="Сплит BEAM датасета (по умолч. 100K)",
     )
+    parser.add_argument(
+        "--skip-errors", action="store_true", default=False,
+        help="Продолжать после ошибки (по умолчанию воркер останавливается)",
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -871,6 +902,7 @@ def cli():
         long_context_workers=args.long_context_workers,
         data_dir=args.data_dir,
         split=args.split,
+        skip_errors=args.skip_errors,
     )
 
 

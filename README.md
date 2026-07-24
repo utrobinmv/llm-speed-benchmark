@@ -2,7 +2,7 @@
 
 Бенчмарк скорости стриминга LLM через OpenAI-compatible API (vLLM, Ollama, и любой совместимый сервер).
 
-Два режима: **однопоточный** и **многопроцессный** с Rich Live-таблицей.
+Три режима: **однопоточный**, **многопроцессный** с Rich Live-таблицей, и **vision** для мультимодальных моделей.
 
 ## Установка
 
@@ -26,7 +26,7 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
-После установки в PATH появляются команды `bench_single` и `bench_multi`.
+После установки в PATH появляются команды `bench_single`, `bench_multi` и `bench_vision`.
 
 ## Настройка
 
@@ -88,6 +88,37 @@ bench_multi -u http://localhost:8000/v1 -m qwen3.5-0.8b -w 4 -d 60
 - Live-обновление метрик каждые 0.5 сек
 - Остановка: `Ctrl+C`
 
+### Vision-бенчмарк (`bench_vision`)
+
+Тестирует скорость мультимодальных моделей (LLM с поддержкой изображений):
+
+```bash
+bench_vision                                       # 4 воркера, авто-генерация изображений
+bench_vision -w 8 -d 120                           # 8 воркеров, 120 сек
+bench_vision --generate 20                         # сгенерировать 20 тестовых изображений
+bench_vision --images ~/workspace/data/images/     # свои изображения (.png, .jpg, .webp)
+bench_vision -p "Опиши что на картинке"            # кастомный промпт
+bench_vision -p "Опиши" -p "Что ты видишь?"       # несколько промптов
+```
+
+**Особенности:**
+- Каждый воркер циклически проходит по всем изображениям
+- Разные промпты для каждого запроса (ротация)
+- Изображения кодируются в base64 и отправляются через OpenAI vision API
+- Если изображения не найдены — автоматически генерируются (градиенты, фигуры, паттерны, шум)
+- Те же метрики: TTFT, скорость генерации, мгновенная скорость
+
+**Аргументы bench_vision:**
+
+| Аргумент | Краткий | Описание |
+|---|---|---|
+| `--workers` | `-w` | Количество воркеров (по умолчанию: 4) |
+| `--duration` | `-d` | Длительность в секундах |
+| `--images` | | Директория с изображениями |
+| `--generate` | | Сгенерировать N тестовых изображений |
+| `--prompt` | `-p` | Кастомный промпт (можно несколько) |
+| `--response-width` | | Ширина колонки Response |
+
 ### Общие аргументы CLI
 
 | Аргумент | Краткий | Описание |
@@ -123,10 +154,19 @@ llm-speed-benchmark/
 │   ├── __init__.py
 │   ├── bench_single.py              # Одиночный воркер
 │   ├── bench_multi.py               # Многопроцессный воркер
+│   ├── bench_vision.py              # Vision-бенчмарк
+│   ├── image_utils.py               # Генерация/загрузка изображений
+│   ├── streaming.py                 # StreamSession + StreamMetrics
+│   ├── cli_common.py                # Общие CLI аргументы
 │   └── utils.py                     # Общие утилиты
 ├── tests/                           # Тесты (pytest)
 │   ├── __init__.py
-│   └── test_bench_single.py
+│   ├── test_bench_single.py
+│   ├── test_bench_multi.py
+│   ├── test_bench_vision.py
+│   ├── test_cli_common.py
+│   ├── test_streaming.py
+│   └── test_long_context.py
 ├── INSTALL.md                       # Инструкция по установке
 ├── README.md
 └── AGENTS.md
