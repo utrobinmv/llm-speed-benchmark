@@ -7,7 +7,8 @@
 Три режима:
 - `bench_single` — последовательные вызовы, накопление контекста, статистика
 - `bench_multi` — N параллельных процессов (multiprocessing), Rich Live-таблица
-- `bench_vision` — бенчмарк vision-модели: отправляет изображения, измеряет TTFT и скорость генерации
+- `bench_vision` — бенчмарк vision/video-модели: отправляет изображения или видео, измеряет TTFT и скорость генерации
+- `bench_audio` — бенчмарк аудио-модели: отправляет аудио файлы, измеряет TTFT и скорость транскрипции
 
 ## Установка
 
@@ -31,15 +32,19 @@ llm-speed-benchmark/
 │   ├── bench_single.py              # Одиночный воркер + cli()
 │   ├── bench_multi.py               # Многопроцессный + LiveTable + cli()
 │   ├── bench_vision.py              # Vision-бенчмарк + cli()
+│   ├── bench_audio.py               # Audio-бенчмарк + cli()
 │   ├── image_utils.py               # Генерация/загрузка изображений
+│   ├── audio_utils.py               # Загрузка аудио из бандла (assets/audio/)
 │   ├── streaming.py                 # StreamSession + StreamMetrics
 │   ├── cli_common.py                # add_common_args(), apply_config()
 │   └── utils.py                     # get_client(), truncate_history(), progress_bar(), format_time()
+├── assets/audio/                    # 10 WAV-файлов с русской речью (~1.7 МБ)
 ├── tests/
 │   ├── __init__.py
 │   ├── test_bench_single.py         # pytest (mock OpenAI)
 │   ├── test_bench_multi.py          # pytest (mock OpenAI + multiprocessing)
 │   ├── test_bench_vision.py         # pytest (image_utils + vision worker)
+│   ├── test_bench_audio.py          # pytest (audio_utils + audio worker)
 │   ├── test_cli_common.py           # pytest (CLI args)
 │   ├── test_streaming.py            # pytest (StreamSession)
 │   └── test_long_context.py         # pytest (long context dataset)
@@ -57,6 +62,7 @@ llm-speed-benchmark/
 bench_single = "llm_speed_benchmark.bench_single:cli"
 bench_multi = "llm_speed_benchmark.bench_multi:cli"
 bench_vision = "llm_speed_benchmark.bench_vision:cli"
+bench_audio = "llm_speed_benchmark.bench_audio:cli"
 ```
 
 ## Зависимости
@@ -102,11 +108,21 @@ bench_multi --max-context 32768                       # Переопределе
 # bench_vision
 bench_vision                                            # 4 воркера, авто-генерация изображений
 bench_vision -w 8 -d 120                                # 8 воркеров, 120 сек
-bench_vision --generate 20                              # сгенерировать 20 изображений
 bench_vision --images ~/workspace/data/benchmark_images/ # свои изображения
 bench_vision -p "Опиши что на картинке" -p "Что ты видишь?"  # кастомные промпты
+bench_vision --max-images 4                             # макс 4 изображения в запросе
+bench_vision --videos ~/workspace/data/test_videos/     # видео-режим: свои видео
+bench_vision --max-videos 4                             # видео-режим, макс 4 в запросе (авто-генерация)
+bench_vision --max-videos 4 -w 8 -d 60                  # видео, 8 воркеров, 60 сек
 
-# Общие аргументы
+# bench_audio
+bench_audio                                             # 4 воркера, авто-генерация аудио
+bench_audio -w 8 -d 120                                 # 8 воркеров, 120 сек
+bench_audio --audio ~/workspace/data/audio/             # свои аудио (.wav, .mp3)
+bench_audio -p "Транскрибируй" -p "Распознай текст"     # кастомные промпты
+bench_audio --max-audio 1                               # макс 1 аудио в запросе
+
+ # Общие аргументы
 -u, --base-url    Адрес API (OpenAI-compatible)
 -k, --api-key     API ключ
 -m, --model       Название модели

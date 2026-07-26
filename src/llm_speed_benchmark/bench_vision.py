@@ -2,9 +2,9 @@
 """
 llm_speed_benchmark/bench_vision.py
 
-Бенчмарк скорости vision-модели (мультимодальная LLM) через OpenAI-compatible API.
+Бенчмарк скорости vision/video-модели (мультимодальная LLM) через OpenAI-compatible API.
 
-Отправляет изображения модели с запросом описания, измеряет:
+Отправляет изображения или видео модели с запросом описания, измеряет:
   - TTFT (Time To First Token)
   - Скорость генерации (токенов/сек)
   - Мгновенную скорость
@@ -16,7 +16,10 @@ llm_speed_benchmark/bench_vision.py
   bench_vision
   bench_vision --workers 4 --duration 120
   bench_vision --images ~/workspace/data/benchmark_images/
-  bench_vision --workers 8 --generate 20
+  bench_vision --max-images 4
+  bench_vision --videos ~/workspace/data/test_videos/
+  bench_vision --max-videos 4
+  bench_vision --max-videos 4 -w 8 -d 60
 """
 
 from __future__ import annotations
@@ -47,9 +50,13 @@ from .cli_common import add_common_args, apply_config
 from .streaming import StreamSession
 from .image_utils import (
     DEFAULT_PROMPTS,
+    DEFAULT_VIDEO_PROMPTS,
     build_vision_message,
+    build_video_message,
     discover_images,
+    discover_videos,
     generate_test_images,
+    generate_test_videos,
     sawtooth_image_count,
 )
 
@@ -62,17 +69,22 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
     worker_id: int,
     q: "Queue",  # type: ignore[reportInvalidTypeForm]
     start_event: "Event",  # type: ignore[reportInvalidTypeForm]
-    image_paths: List[str],
+    media_paths: List[str],
     duration: Optional[int],
     prompts: List[str],
     max_images: int,
     skip_errors: bool = False,
+    video_mode: bool = False,
+    max_videos: int = 1,
 ) -> None:
-    """Воркер: загружает изображения и отправляет их модели.
+    """Воркер: загружает медиа (изображения или видео) и отправляет модели.
 
-    Каждый воркер циклически проходит по всем изображениям, используя
+    В режиме изображений — циклически проходит по всем изображениям, используя
     разные промпты. Количество изображений в запросе меняется по
     пиломобразному паттерну: max, max-1, ..., 1, 2, ..., max-1.
+
+    В режиме видео — аналогично, количество видео в запросе меняется по
+    пиломобразному паттерну: max_videos, max_videos-1, ..., 1, 2, ..., max_videos-1.
 
     При ошибке воркер останавливается (skip_errors=False) или продолжает
     со следующим запросом (skip_errors=True).
@@ -81,17 +93,19 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
         worker_id: ID воркера.
         q: Queue для сообщений.
         start_event: Event для синхронизации старта.
-        image_paths: Пути к изображениям.
+        media_paths: Пути к медиа (изображения или видео).
         duration: Длительность в секундах (None = без ограничения).
         prompts: Список промптов для ротации.
         max_images: Максимум изображений в одном запросе.
         skip_errors: Если True — продолжать после ошибки.
+        video_mode: Если True — отправлять видео вместо изображений.
+        max_videos: Максимум видео в одном запросе (пилообразный паттерн).
     """
     try:
         client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=600.0)
         session = StreamSession(client)
 
-        q.put({"type": "start", "id": worker_id, "images": len(image_paths)})
+        q.put({"type": "start", "id": worker_id, "media": len(media_paths)})
 
         start_time = time.time()
         call_count = 0
@@ -99,9 +113,9 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
         total_chunks = 0
         total_ttft = 0.0
         ttft_count = 0
-        img_index = 0
+        media_index = 0
         prompt_index = 0
-        current_img_count = max_images  # для live callback
+        current_count = 1  # для live callback (images или 1 video)
 
         # Shared state для потока time_sender
         from threading import Lock, Thread
@@ -145,6 +159,7 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
         ) -> None:
             current_ttft = ttft if ttft is not None else 0
             ttft_sum_live = total_ttft + current_ttft
+            media_name = Path(media_paths[media_index % len(media_paths)]).stem
             q.put({
                 "type": "live",
                 "id": worker_id,
@@ -157,33 +172,44 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                 "ttft": ttft if ttft is not None else 0,
                 "ttft_sum": round(ttft_sum_live, 2),
                 "wall": format_time(wall_elapsed),
-                "img": Path(image_paths[img_index % len(image_paths)]).stem,
-                "img_count": current_img_count,
+                "media": media_name,
+                "media_count": current_count,
             })
 
         start_event.wait()
 
         while duration is None or (time.time() - start_time < duration):
-            if not image_paths:
+            if not media_paths:
                 break
 
             wall_total = time.time() - start_time
 
-            # Пилообразный паттерн: max, max-1, ..., 1, 2, ..., max-1
-            num_images = sawtooth_image_count(call_count, max_images)
-            # Ограничиваем количеством доступных изображений
-            num_images = min(num_images, len(image_paths))
-            current_img_count = num_images
+            if video_mode:
+                # Видео: пиломобразный паттерн
+                num_media = sawtooth_image_count(call_count, max_videos)
+                num_media = min(num_media, len(media_paths))
+                current_count = num_media
+                selected_media = [
+                    media_paths[(media_index + i) % len(media_paths)]
+                    for i in range(num_media)
+                ]
+            else:
+                # Изображения: пилообразный паттерн
+                num_media = sawtooth_image_count(call_count, max_images)
+                num_media = min(num_media, len(media_paths))
+                current_count = num_media
+                selected_media = [
+                    media_paths[(media_index + i) % len(media_paths)]
+                    for i in range(num_media)
+                ]
 
-            # Выбираем изображения и промпт
-            selected_images: List[str] = [
-                image_paths[(img_index + i) % len(image_paths)]
-                for i in range(num_images)
-            ]
             prompt = prompts[prompt_index % len(prompts)]
 
-            # Строим vision message
-            messages = build_vision_message(selected_images, prompt)
+            # Строим message (image или video)
+            if video_mode:
+                messages = build_video_message(selected_media, prompt)
+            else:
+                messages = build_vision_message(selected_media, prompt)
 
             assistant_content = ""
             metrics = None
@@ -202,16 +228,16 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                 )
                 assistant_content = metrics.assistant_content
 
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE0414
                 error_msg = f"[red]Worker {worker_id} stopped: {exc}[/]"
-                q.put({
-                    "type": "error_stop",
-                    "id": worker_id,
-                    "error": str(exc),
-                    "calls": call_count,
-                    "wall": format_time(time.time() - start_time),
-                })
                 if not skip_errors:
+                    q.put({
+                        "type": "error_stop",
+                        "id": worker_id,
+                        "error": str(exc),
+                        "calls": call_count,
+                        "wall": format_time(time.time() - start_time),
+                    })
                     # Воркер останавливается
                     break
                 assistant_content = error_msg
@@ -225,8 +251,8 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                     "type": "stats",
                     "id": worker_id,
                     "calls": call_count,
-                    "img": Path(selected_images[0]).stem,
-                    "img_count": current_img_count,
+                    "media": Path(selected_media[0]).stem,
+                    "media_count": current_count,
                     "g": total_gen,
                     "cg": 0,
                     "speed": 0,
@@ -236,7 +262,7 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                     "tail": assistant_content[:80] if assistant_content else "error",
                     "wall": format_time(wall_total),
                 })
-                img_index += num_images
+                media_index += current_count
                 prompt_index += 1
                 continue
 
@@ -249,8 +275,8 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                     "type": "stats",
                     "id": worker_id,
                     "calls": call_count,
-                    "img": Path(selected_images[0]).stem,
-                    "img_count": current_img_count,
+                    "media": Path(selected_media[0]).stem,
+                    "media_count": current_count,
                     "g": total_gen,
                     "cg": 0,
                     "speed": 0,
@@ -260,7 +286,7 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                     "tail": "empty",
                     "wall": format_time(wall_total),
                 })
-                img_index += num_images
+                media_index += current_count
                 prompt_index += 1
                 continue
 
@@ -288,8 +314,8 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                 "type": "stats",
                 "id": worker_id,
                 "calls": call_count,
-                "img": Path(selected_images[0]).stem,
-                "img_count": current_img_count,
+                "media": Path(selected_media[0]).stem,
+                "media_count": current_count,
                 "g": total_gen,
                 "cg": completion_tokens,
                 "chunks": total_chunks,
@@ -303,7 +329,7 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                 "wall": format_time(wall_total),
             })
 
-            img_index += num_images
+            media_index += current_count
             prompt_index += 1
 
     except Exception:
@@ -321,10 +347,17 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
 class VisionLiveTable:
     """Rich Live таблица для vision-бенчмарка."""
 
-    def __init__(self, duration: Optional[int], total_workers: int, response_width: int = 60) -> None:
+    def __init__(
+        self,
+        duration: Optional[int],
+        total_workers: int,
+        response_width: int = 60,
+        video_mode: bool = False,
+    ) -> None:
         self.duration = duration
         self.total_workers = total_workers
         self.response_width = response_width
+        self.video_mode = video_mode
         self.workers: Dict[int, Dict[str, Any]] = {}
         self._errors: Dict[int, str] = {}
         self.console = Console()
@@ -335,7 +368,7 @@ class VisionLiveTable:
             if v is not None:
                 w[k] = v
 
-    def mark_started(self, worker_id: int, image_count: int = 0) -> None:
+    def mark_started(self, worker_id: int, media_count: int = 0) -> None:
         self.workers[worker_id] = {
             "calls": 0,
             "gen": 0,
@@ -348,18 +381,18 @@ class VisionLiveTable:
             "ttft_sum": 0,
             "wall": "",
             "tail": "[dim]waiting...[/]",
-            "img": "",
-            "img_count": 0,
-            "images": image_count,
+            "media": "",
+            "media_count": 0,
+            "total_media": media_count,
         }
 
     def update_stats(self, msg: Dict[str, Any]) -> None:
         w = self.workers.setdefault(msg["id"], {})
         self._merge(w, {
             "calls": msg.get("calls"),
-            "img": msg.get("img"),
-            "img_count": msg.get("img_count"),
-            "g": msg.get("g"),
+            "media": msg.get("media") or msg.get("img"),
+            "media_count": msg.get("media_count") or msg.get("img_count"),
+            "gen": msg.get("g"),
             "gen_est": msg.get("est_gen"),
             "chunks": msg.get("chunks"),
             "call_gen": msg.get("cg"),
@@ -382,8 +415,8 @@ class VisionLiveTable:
             "chunks": msg.get("chunks"),
             "wall": msg.get("wall"),
             "tail": msg.get("tail"),
-            "img": msg.get("img", ""),
-            "img_count": msg.get("img_count", 0),
+            "media": msg.get("media") or msg.get("img", ""),
+            "media_count": msg.get("media_count") or msg.get("img_count", 0),
         })
 
     def update_time(self, msg: Dict[str, Any]) -> None:
@@ -468,8 +501,12 @@ class VisionLiveTable:
 
         table.add_column("W#", style="cyan", width=4, justify="right")
         table.add_column("Calls", style="magenta", width=6, justify="right")
-        table.add_column("Imgs", style="bold yellow", width=5, justify="right")
-        table.add_column("Image", style="green", width=14)
+        if self.video_mode:
+            table.add_column("Vid", style="bold yellow", width=5, justify="right")
+            table.add_column("Video", style="green", width=14)
+        else:
+            table.add_column("Imgs", style="bold yellow", width=5, justify="right")
+            table.add_column("Image", style="green", width=14)
         table.add_column("Gen", style="yellow", width=8, justify="right")
         table.add_column("Call", style="white", width=7, justify="right")
         table.add_column("Speed", style="bold green", width=9, justify="right")
@@ -520,14 +557,14 @@ class VisionLiveTable:
 
             gen_val = w.get("gen_est", w.get("gen", 0))
             tail = self._clean_tail(w.get("tail", ""), self.response_width)
-            img_name = w.get("img", "")
-            img_count = w.get("img_count", 0)
+            media_name = w.get("media", "")
+            media_count = w.get("media_count", 0)
 
             table.add_row(
                 str(wid),
                 str(w.get("calls", 0)),
-                str(img_count),
-                img_name,
+                str(media_count),
+                media_name,
                 f"{gen_val:,}",
                 f"{w.get('call_gen', 0):,}",
                 f"{w.get('speed', 0):.1f} t/s",
@@ -552,13 +589,15 @@ def run_benchmark(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     images_dir: Optional[str] = None,
-    generate_images: Optional[int] = None,
+    videos_dir: Optional[str] = None,
     max_images: int = 1,
+    max_videos: int = 1,
     skip_errors: bool = False,
     response_width: int = 60,
     prompts: Optional[List[str]] = None,
+    video_mode: bool = False,
 ) -> None:
-    """Запускает vision-бенчмарк.
+    """Запускает vision-бенчмарк (изображения или видео).
 
     Args:
         workers: Количество параллельных воркеров.
@@ -567,60 +606,96 @@ def run_benchmark(
         api_key: Переопределение API_KEY.
         model: Переопределение MODEL.
         images_dir: Директория с изображениями.
-        generate_images: Сгенерировать N тестовых изображений.
+        videos_dir: Директория с видео.
         max_images: Максимум изображений в одном запросе.
-        skip_errors: Если True — продолжать после ошибки (по умолчанию воркер останавливается).
+        max_videos: Максимум видео в одном запросе.
+        skip_errors: Если True — продолжать после ошибки.
         response_width: Ширина колонки Response.
-        prompts: Кастомные промпты (по умолчанию DEFAULT_PROMPTS).
+        prompts: Кастомные промпты.
+        video_mode: Если True — режим видео вместо изображений.
     """
     apply_config(base_url=base_url, api_key=api_key, model=model)
 
     import llm_speed_benchmark.utils as _u  # noqa: PLC0414
 
-    if prompts is None:
-        prompts = list(DEFAULT_PROMPTS)
-
-    # --- Подготовка изображений ---
-    temp_dir = Path(os.path.expanduser("~/.llm-speed-benchmark/tmp/vision_images"))
-    image_paths: List[str] = []
-
-    if generate_images is not None and generate_images > 0:
-        print(f"Генерация {generate_images} тестовых изображений...")
-        generated = generate_test_images(temp_dir, count=generate_images)
-        image_paths = [str(p) for p in generated]
-        print(f"  Создано: {temp_dir}")
-    elif images_dir is not None:
-        found = discover_images(images_dir)
-        image_paths = [str(p) for p in found]
-        if not image_paths:
-            print(f"Ошибка: изображения не найдены в {images_dir}")
-            sys.exit(1)
-        print(f"Найдено {len(image_paths)} изображений в {images_dir}")
+    if video_mode:
+        if prompts is None:
+            prompts = list(DEFAULT_VIDEO_PROMPTS)
     else:
-        # По умолчанию ищем в ~/.llm-speed-benchmark/tmp/vision_images/
-        found = discover_images(temp_dir)
-        if found:
-            image_paths = [str(p) for p in found]
-            print(f"Найдено {len(image_paths)} изображений в {temp_dir}")
-        else:
-            # Генерируем по умолчанию
-            print(f"Изображения не найдены, генерирую {len(DEFAULT_PROMPTS) * 2} тестовых...")
-            generated = generate_test_images(temp_dir, count=len(DEFAULT_PROMPTS) * 2)
-            image_paths = [str(p) for p in generated]
-            print(f"  Создано: {temp_dir}")
+        if prompts is None:
+            prompts = list(DEFAULT_PROMPTS)
 
-    if not image_paths:
-        print("Ошибка: нет изображений для бенчмарка.")
+    # --- Подготовка медиа ---
+    if video_mode:
+        temp_dir = Path(os.path.expanduser("~/.llm-speed-benchmark/tmp/vision_videos"))
+        media_paths: List[str] = []
+
+        if videos_dir is not None:
+            found = discover_videos(videos_dir)
+            media_paths = [str(p) for p in found]
+            if not media_paths:
+                print(f"Ошибка: видео не найдены в {videos_dir}")
+                sys.exit(1)
+            print(f"Найдено {len(media_paths)} видео в {videos_dir}")
+        else:
+            # По умолчанию ищем в ~/.llm-speed-benchmark/tmp/vision_videos/
+            found = discover_videos(temp_dir)
+            if found:
+                media_paths = [str(p) for p in found]
+                print(f"Найдено {len(media_paths)} видео в {temp_dir}")
+            else:
+                # Пробуем сгенерировать (минимум max_videos)
+                gen_count = max(len(DEFAULT_VIDEO_PROMPTS) * 2, max_videos)
+                print(f"Видео не найдены, генерирую {gen_count} тестовых...")
+                try:
+                    generated = generate_test_videos(temp_dir, count=gen_count)
+                    media_paths = [str(p) for p in generated]
+                    print(f"  Создано: {temp_dir}")
+                except ValueError as exc:
+                    print(f"Ошибка: {exc}")
+                    sys.exit(1)
+    else:
+        temp_dir = Path(os.path.expanduser("~/.llm-speed-benchmark/tmp/vision_images"))
+        media_paths: List[str] = []
+
+        if images_dir is not None:
+            found = discover_images(images_dir)
+            media_paths = [str(p) for p in found]
+            if not media_paths:
+                print(f"Ошибка: изображения не найдены в {images_dir}")
+                sys.exit(1)
+            print(f"Найдено {len(media_paths)} изображений в {images_dir}")
+        else:
+            # По умолчанию ищем в ~/.llm-speed-benchmark/tmp/vision_images/
+            found = discover_images(temp_dir)
+            if found:
+                media_paths = [str(p) for p in found]
+                print(f"Найдено {len(media_paths)} изображений в {temp_dir}")
+            else:
+                # Генерируем минимум max_images
+                gen_count = max(len(DEFAULT_PROMPTS) * 2, max_images)
+                print(f"Изображения не найдены, генерирую {gen_count} тестовых...")
+                generated = generate_test_images(temp_dir, count=gen_count)
+                media_paths = [str(p) for p in generated]
+                print(f"  Создано: {temp_dir}")
+
+    if not media_paths:
+        print("Ошибка: нет медиа для бенчмарка.")
         sys.exit(1)
 
     # --- Заголовок ---
+    mode_label = "Video" if video_mode else "Vision"
     print("=" * 70)
-    print("  LLM Vision Benchmark")
+    print(f"  LLM {mode_label} Benchmark")
     print("=" * 70)
     print(f"  Модель:         {_u.MODEL}")
     print(f"  Воркеров:       {workers}")
-    print(f"  Изображений:    {len(image_paths)}")
-    print(f"  Max imgs/req:   {max_images}")
+    if video_mode:
+        print(f"  Видео:          {len(media_paths)}")
+        print(f"  Max vids/req:   {max_videos}")
+    else:
+        print(f"  Изображений:    {len(media_paths)}")
+        print(f"  Max imgs/req:   {max_images}")
     print(f"  Промптов:       {len(prompts)}")
     if duration is not None:
         print(f"  Длительность:   {duration}с")
@@ -635,14 +710,14 @@ def run_benchmark(
     for i in range(workers):
         p = Process(
             target=_worker,
-            args=(i, q, start_event, image_paths, duration, prompts, max_images, skip_errors),
+            args=(i, q, start_event, media_paths, duration, prompts, max_images, skip_errors, video_mode, max_videos),
             daemon=True,
         )
         p.start()
         processes.append(p)
 
     # --- Live table ---
-    table = VisionLiveTable(duration, workers, response_width)
+    table = VisionLiveTable(duration, workers, response_width, video_mode=video_mode)
     live = Live(table.render(), console=table.console, refresh_per_second=4)
     live.start()
 
@@ -679,7 +754,7 @@ def run_benchmark(
 
             msg_type = msg.get("type")
             if msg_type == "start":
-                table.mark_started(msg["id"], msg.get("images", 0))
+                table.mark_started(msg["id"], msg.get("media", 0))
             elif msg_type == "stats":
                 table.update_stats(msg)
             elif msg_type == "live":
@@ -752,8 +827,8 @@ def cli() -> None:
         help="Директория с изображениями для теста",
     )
     parser.add_argument(
-        "--generate", type=int, default=None,
-        help="Сгенерировать N тестовых изображений (вместо загрузки из директории)",
+        "--videos", type=str, default=None,
+        help="Директория с видео для теста (переключает в видео-режим)",
     )
     parser.add_argument(
         "--response-width", type=int, default=60,
@@ -768,11 +843,18 @@ def cli() -> None:
         help="Максимум изображений в одном запросе (пилообразный паттерн: N..1..N-1). По умолчанию: 1",
     )
     parser.add_argument(
+        "--max-videos", type=int, default=1,
+        help="Максимум видео в одном запросе (пилообразный паттерн: N..1..N-1). По умолчанию: 1",
+    )
+    parser.add_argument(
         "--skip-errors", action="store_true", default=False,
         help="Продолжать после ошибки (по умолчанию воркер останавливается)",
     )
 
     args = parser.parse_args()
+
+    # Видео-режим включается если указан --videos или --max-videos >= 1
+    video_mode = args.videos is not None or args.max_videos >= 1
 
     prompts = args.prompt if args.prompt else None
 
@@ -783,11 +865,13 @@ def cli() -> None:
         api_key=args.api_key,
         model=args.model,
         images_dir=args.images,
-        generate_images=args.generate,
+        videos_dir=args.videos,
         max_images=args.max_images,
+        max_videos=args.max_videos,
         skip_errors=args.skip_errors,
         response_width=args.response_width,
         prompts=prompts,
+        video_mode=video_mode,
     )
 
 

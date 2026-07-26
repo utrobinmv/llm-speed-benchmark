@@ -401,3 +401,39 @@ class TestConfig:
         client = get_client()
         assert client is not None
         assert hasattr(client, "chat")
+
+    def test_detect_model_context_length_success(self):
+        """detect_model_context_length возвращает max_model_len от API."""
+        from llm_speed_benchmark.utils import detect_model_context_length
+
+        mock_client = MagicMock()
+        mock_model = MagicMock()
+        mock_model.max_model_len = 131072
+        mock_client.models.retrieve.return_value = mock_model
+
+        result = detect_model_context_length(mock_client, "test-model")
+        assert result == 131072
+
+    def test_detect_model_context_length_fallback(self):
+        """detect_model_context_length возвращает MAX_CONTEXT_TOKENS при ошибке."""
+        from llm_speed_benchmark.utils import detect_model_context_length
+
+        mock_client = MagicMock()
+        mock_client.models.retrieve.side_effect = Exception("Not found")
+
+        with patch("llm_speed_benchmark.utils.MAX_CONTEXT_TOKENS", 262144):
+            result = detect_model_context_length(mock_client, "test-model")
+        assert result == 262144
+
+    def test_detect_model_context_length_no_max_model_len(self):
+        """Если max_model_len отсутствует — fallback."""
+        from llm_speed_benchmark.utils import detect_model_context_length
+
+        mock_client = MagicMock()
+        mock_model = MagicMock()
+        mock_model.max_model_len = None
+        mock_client.models.retrieve.return_value = mock_model
+
+        with patch("llm_speed_benchmark.utils.MAX_CONTEXT_TOKENS", 262144):
+            result = detect_model_context_length(mock_client, "test-model")
+        assert result == 262144

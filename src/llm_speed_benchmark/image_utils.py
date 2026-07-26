@@ -11,9 +11,12 @@ llm_speed_benchmark/image_utils.py
 from __future__ import annotations
 
 import base64
+import os
 import random
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFilter
 
@@ -338,7 +341,7 @@ def sawtooth_image_count(call_index: int, max_images: int) -> int:
     """
     if max_images < 1:
         max_images = 1
-    elif max_images == 1:
+    if max_images == 1:
         return 1
 
     period = 2 * (max_images - 1)
@@ -347,3 +350,298 @@ def sawtooth_image_count(call_index: int, max_images: int) -> int:
         return max_images - phase
     else:
         return phase - max_images + 2
+
+
+# ---------------------------------------------------------------------------
+# Video utilities
+# ---------------------------------------------------------------------------
+
+def generate_test_videos(
+    output_dir: str | Path,
+    count: int = 4,
+    seed: int = 42,
+    frames: int = 15,
+    fps: int = 5,
+    size: Tuple[int, int] = (256, 256),
+) -> List[Path]:
+    """Генерирует набор коротких тестовых видео для vision-бенчмарка.
+
+    Создаёт анимированные MP4-видео с движущимися фигурами, градиентами
+    и паттернами. Использует Pillow для генерации кадров и ffmpeg для
+    кодирования в MP4 (libx264).
+
+    Если ffmpeg недоступен, падает с ValueError — пользователь должен
+    установить ffmpeg или указать свои видео через --videos.
+
+    Args:
+        output_dir: Директория для сохранения видео.
+        count: Количество видео (минимум 1).
+        seed: Seed для воспроизводимости.
+        frames: Количество кадров в каждом видео.
+        fps: Кадров в секунду.
+        size: Разрешение видео (ширина, высота).
+
+    Returns:
+        Список Path к сохранённым .mp4 файлам.
+    """
+    if count < 1:
+        count = 1
+
+    random.seed(seed)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    videos: List[Path] = []
+
+    for i in range(count):
+        variant = i % 6
+        rng = random.Random(seed + i)
+
+        frames_list: List[Image.Image] = []
+        for f in range(frames):
+            frame = _generate_video_frame(variant, size, f, frames, rng)
+            frames_list.append(frame)
+
+        path = output_dir / f"test_video_{i:03d}.mp4"
+        _frames_to_mp4(frames_list, str(path), fps)
+        videos.append(path)
+
+    return videos
+
+
+def _generate_video_frame(
+    variant: int,
+    size: Tuple[int, int],
+    frame_idx: int,
+    total_frames: int,
+    rng: random.Random,
+) -> "Image.Image":
+    """Генерирует один кадр видео.
+
+    Варианты анимации:
+      0 — движущийся круг
+      1 — пульсирующие квадраты
+      2 — вращающийся градиент
+      3 — бегущие полосы
+      4 — меняющийся шум
+      5 — анимированный текст
+    """
+    t = frame_idx / max(total_frames - 1, 1)  # 0..1
+    w, h = size
+
+    if variant == 0:
+        # Движущийся круг
+        img = Image.new("RGB", size, (30, 30, 60))
+        draw = ImageDraw.Draw(img)
+        cx = int(size[0] * (0.2 + 0.6 * t))
+        cy = int(size[1] * (0.5 + 0.3 * _sin(t * 6.28)))
+        r = int(min(size) * 0.15)
+        hue = int(255 * t)
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(hue, 255 - hue, 128))
+        return img
+
+    elif variant == 1:
+        # Пульсирующие квадраты
+        img = Image.new("RGB", size, (20, 20, 40))
+        draw = ImageDraw.Draw(img)
+        for sq in range(5):
+            offset = max(0, int(min(size) * (0.05 + 0.1 * _sin(t * 6.28 + sq))))
+            color = (
+                int(255 * ((sq + 1) / 6)),
+                int(255 * (1 - (sq + 1) / 6)),
+                128,
+            )
+            x0 = offset + sq * 10
+            y0 = offset + sq * 10
+            x1 = max(x0 + 1, size[0] - offset - sq * 10)
+            y1 = max(y0 + 1, size[1] - offset - sq * 10)
+            draw.rectangle(
+                [x0, y0, x1, y1],
+                outline=color,
+                width=2,
+            )
+        return img
+
+    elif variant == 2:
+        # Вращающийся градиент
+        img = Image.new("RGB", size)
+        pixels = img.load()  # type: ignore[assignment]
+        angle = t * 6.28
+        for x in range(w):
+            for y in range(h):
+                nx = (x - w // 2) / max(w, 1)
+                ny = (y - h // 2) / max(h, 1)
+                rot_x = nx * _cos(angle) - ny * _sin(angle)
+                r = int(128 + 127 * rot_x)
+                g = int(128 + 127 * ny)
+                pixels[x, y] = (max(0, min(255, r)), max(0, min(255, g)), 100)  # type: ignore[index]
+        return img
+
+    elif variant == 3:
+        # Бегущие горизонтальные полосы
+        img = Image.new("RGB", size, (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        stripe_h = 20
+        offset = int(t * stripe_h)
+        for y in range(0, h, stripe_h):
+            if ((y + offset) // stripe_h) % 2 == 0:
+                color = (0, int(100 + 155 * t), int(100 + 155 * (1 - t)))
+                draw.rectangle([0, y, w - 1, min(y + stripe_h - 1, h - 1)], fill=color)
+        return img
+
+    elif variant == 4:
+        # Меняющийся шум
+        noise_rng = random.Random(frame_idx * 1000 + rng.randint(0, 10000))
+        pixels = [noise_rng.randint(0, 255) for _ in range(w * h * 3)]
+        img = Image.frombytes("RGB", size, bytes(pixels))
+        return img.filter(ImageFilter.GaussianBlur(radius=3))
+
+    else:
+        # Анимированный текст (появляется по буквам)
+        bg_color = (rng.randint(0, 80), rng.randint(0, 80), rng.randint(100, 255))
+        img = Image.new("RGB", size, bg_color)
+        draw = ImageDraw.Draw(img)
+        text = "BENCHMARK"
+        visible_chars = max(1, int(len(text) * t))
+        partial = text[:visible_chars]
+        bbox = draw.textbbox((0, 0), partial)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        x = (size[0] - tw) // 2
+        y = (size[1] - th) // 2
+        draw.text((x, y), partial, fill=(255, 255, 255))
+        return img
+
+
+def _cos(x: float) -> float:
+    """cos(x) через sin(x + pi/2)."""
+    return _sin(x + 1.5708)
+
+
+def _frames_to_mp4(frames: List["Image.Image"], output_path: str, fps: int) -> None:
+    """Кодирует список PIL-кадров в MP4 через ffmpeg.
+
+    Args:
+        frames: Список PIL Image.
+        output_path: Путь к выходному .mp4.
+        fps: Кадров в секунду.
+    """
+    if not _ffmpeg_available():
+        raise ValueError(
+            "ffmpeg не найден. Установите ffmpeg или укажите свои видео через --videos."
+        )
+
+    width, height = frames[0].size
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Сохраняем кадры как PNG
+        for i, frame in enumerate(frames):
+            frame.save(os.path.join(tmpdir, f"frame_{i:04d}.png"))
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-framerate", str(fps),
+                "-i", os.path.join(tmpdir, "frame_%04d.png"),
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "ultrafast",
+                output_path,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+
+
+def _ffmpeg_available() -> bool:
+    """Проверяет доступность ffmpeg."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            timeout=5,
+        )
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def load_video_as_base64(video_path: str | Path) -> Tuple[str, str]:
+    """Загружает видео и кодирует в base64.
+
+    Args:
+        video_path: Путь к файлу видео.
+
+    Returns:
+        Кортеж (mime_type, base64_string).
+    """
+    suffix = Path(video_path).suffix.lower()
+    mime_map = {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".avi": "video/x-msvideo",
+        ".webm": "video/webm",
+        ".gif": "image/gif",
+    }
+    mime = mime_map.get(suffix, "video/mp4")
+
+    with open(video_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return mime, b64
+
+
+def build_video_message(
+    video_paths: Sequence[str | Path],
+    prompt: str = "Опиши подробно что происходит на этом видео.",
+) -> list:
+    """Создаёт message для video-запроса (OpenAI format).
+
+    Args:
+        video_paths: Путь или список путей к видео.
+        prompt: Текстовый промпт.
+
+    Returns:
+        Список сообщений в формате OpenAI chat API.
+    """
+    content_parts: list = [{"type": "text", "text": prompt}]
+    for vid_path in video_paths:
+        mime, b64 = load_video_as_base64(vid_path)
+        content_parts.append({
+            "type": "video_url",
+            "video_url": {
+                "url": f"data:{mime};base64,{b64}",
+                "detail": "auto",
+            },
+        })
+    return [{"role": "user", "content": content_parts}]
+
+
+def discover_videos(directory: str | Path) -> List[Path]:
+    """Находит все видео в директории.
+
+    Args:
+        directory: Директория для поиска.
+
+    Returns:
+        Отсортированный список Path к видео (.mp4, .mov, .avi, .webm, .gif).
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+
+    extensions = {".mp4", ".mov", ".avi", ".webm", ".gif"}
+    videos = sorted([
+        p for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() in extensions
+    ])
+    return videos
+
+
+DEFAULT_VIDEO_PROMPTS = [
+    "Опиши подробно что происходит на этом видео.",
+    "Расскажи что ты видишь в этом видео.",
+    "Опиши действия и события на видео максимально подробно.",
+    "Что происходит? Опиши движение, цвета и изменения.",
+    "Подробно опиши содержание этого видео.",
+]

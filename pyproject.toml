@@ -43,6 +43,7 @@ long-context = [
 bench_single = "llm_speed_benchmark.bench_single:cli"
 bench_multi = "llm_speed_benchmark.bench_multi:cli"
 bench_vision = "llm_speed_benchmark.bench_vision:cli"
+bench_audio = "llm_speed_benchmark.bench_audio:cli"
 
 [project.urls]
 Homepage = "https://github.com/utrobinmv/llm-speed-benchmark"
