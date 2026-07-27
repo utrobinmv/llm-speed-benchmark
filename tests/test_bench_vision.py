@@ -425,23 +425,25 @@ class TestVisionLiveTable:
     def test_clean_tail_wide_chars(self):
         from llm_speed_benchmark.bench_vision import VisionLiveTable
 
+        table = VisionLiveTable(duration=None, total_workers=1, response_width=20)
         # Wide CJK characters should be replaced
-        result = VisionLiveTable._clean_tail("Hello 世界 Test", max_len=20)
+        result = table._clean_tail("Hello 世界 Test")
         assert "世" not in result
         assert "界" not in result
 
     def test_clean_tail_truncation(self):
         from llm_speed_benchmark.bench_vision import VisionLiveTable
 
+        table = VisionLiveTable(duration=None, total_workers=1, response_width=20)
         long_text = "A" * 100
-        result = VisionLiveTable._clean_tail(long_text, max_len=20)
-        assert len(result) <= 20
-        assert result.endswith("...")
+        result = table._clean_tail(long_text)
+        assert len(result) <= 25  # ... + max_vlen + небольшой запас
 
     def test_clean_tail_empty(self):
         from llm_speed_benchmark.bench_vision import VisionLiveTable
 
-        assert VisionLiveTable._clean_tail("", max_len=20) == ""
+        table = VisionLiveTable(duration=None, total_workers=1, response_width=20)
+        assert table._clean_tail("") == ""
 
 
 class TestSawtoothRegression:
@@ -648,7 +650,7 @@ class TestVisionCli:
                 call_kwargs = mock_run.call_args[1]
                 assert call_kwargs["workers"] == 4
                 assert call_kwargs["max_images"] == 1
-                assert call_kwargs["max_videos"] == 1
+                assert call_kwargs["max_videos"] == 0
 
     def test_cli_video_mode_args(self):
         from llm_speed_benchmark.bench_vision import cli

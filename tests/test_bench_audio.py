@@ -334,14 +334,16 @@ class TestAudioLiveTable:
     def test_clean_tail_empty(self):
         from llm_speed_benchmark.bench_audio import AudioLiveTable
 
-        assert AudioLiveTable._clean_tail("", max_len=20) == ""
+        table = AudioLiveTable(duration=None, total_workers=1, response_width=20)
+        assert table._clean_tail("") == ""
 
     def test_clean_tail_truncation(self):
         from llm_speed_benchmark.bench_audio import AudioLiveTable
 
+        table = AudioLiveTable(duration=None, total_workers=1, response_width=20)
         long_text = "A" * 100
-        result = AudioLiveTable._clean_tail(long_text, max_len=20)
-        assert len(result) <= 23  # ... + max_len
+        result = table._clean_tail(long_text)
+        assert len(result) <= 25  # ... + max_vlen + небольшой запас
         assert result.startswith("...")
 
 

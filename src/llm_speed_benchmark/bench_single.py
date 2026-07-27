@@ -66,10 +66,10 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
     print()
 
     total_completion_tokens = 0
-    history_tokens = 0
+    prompt_tokens = 0
     start_wall = time.time()
     turn = 0
-    last_stats_time = time.time()
+    last_tick = time.time()
 
     # Суммарный TTFT (Time To First Token) по всем turn'ам
     total_ttft = 0.0
@@ -85,15 +85,14 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
             prompt_text = prompts[0 if turn == 1 else 1]
 
             # Проверка контекста
-            if history_tokens + total_completion_tokens >= _u.MAX_CONTEXT_TOKENS:
+            if prompt_tokens + total_completion_tokens >= _u.MAX_CONTEXT_TOKENS:
                 break
 
-            if history_tokens + total_completion_tokens >= _token_limit_warn():
+            if prompt_tokens + total_completion_tokens >= _token_limit_warn():
                 messages = truncate_history(messages)
 
             messages.append({"role": "user", "content": prompt_text})
 
-            turn_start = time.time()
             last_tick = time.time()
 
             # === Streaming через StreamSession ===
@@ -107,11 +106,8 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
                 raise
 
             completion_tokens = metrics.completion_tokens
-            history_tokens = metrics.prompt_tokens
+            prompt_tokens = metrics.prompt_tokens
             chunk_count = metrics.chunk_count
-            first_token_time = (
-                turn_start + metrics.ttft if metrics.ttft is not None else None
-            )
             assistant_content = metrics.assistant_content
             elapsed = metrics.elapsed
 
@@ -161,13 +157,13 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
             call_gen = completion_tokens
 
             avg_speed = total_completion_tokens / wall_total if wall_total > 0 else 0
-            total_tokens = history_tokens + completion_tokens
+            total_tokens = prompt_tokens + completion_tokens
             speed = metrics.call_speed
 
             # === Статичная строка ===
             turn_ttft_str = f" | TTFT {metrics.ttft:.2f}s" if metrics.ttft is not None else ""
             print(f"\r\033[2KCall {turn:>3} | "
-                  f"Prompt {history_tokens:,} | "
+                  f"Prompt {prompt_tokens:,} | "
                   f"Gen {total_completion_tokens:,} | "
                   f"Call {call_gen:,} | "
                   f"Total {total_tokens:,} / {_u.MAX_CONTEXT_TOKENS:,} | "
@@ -188,7 +184,7 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
     # Итоги
     # ------------------------------------------------------------------
     wall_time = time.time() - start_wall
-    total_tokens = history_tokens + total_completion_tokens
+    total_tokens = prompt_tokens + total_completion_tokens
     avg_speed = total_completion_tokens / wall_time if wall_time > 0 else 0
     avg_ttft = total_ttft / ttft_count if ttft_count > 0 else 0
 
@@ -196,7 +192,7 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
     print("  ИТОГИ")
     print("=" * 70)
     print(f"  Поворотов:        {turn}")
-    print(f"  Prompt (история): {history_tokens:,}")
+    print(f"  Prompt (история): {prompt_tokens:,}")
     print(f"  Completion cum:   {total_completion_tokens:,}")
     print(f"  Всего:            {total_tokens:,}")
     print(f"  Стен-тайм:        {format_time(wall_time)} ({wall_time:.1f}с)")

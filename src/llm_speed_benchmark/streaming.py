@@ -4,13 +4,15 @@ llm_speed_benchmark/streaming.py
 Общая логика стриминга LLM -- извлечение из bench_single и bench_multi.
 
 StreamMetrics  -- результат одного вызова (токены, TTFT, скорость, контент).
-StreamSession  -- выполняет streaming-вызов, собирает метрики, калибрует tokens_per_chunk.
+StreamSession  -- выполняет streaming-вызов, собирает метрики.
+
+Упрощение: 1 чанк ≈ 1 токен. Точные значения берутся из usage при завершении.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from openai import OpenAI
@@ -26,46 +28,40 @@ class StreamMetrics:
     elapsed: float = 0.0
     ttft: Optional[float] = None
     assistant_content: str = ""
-    # Мгновенная скорость (последние N чанков)
+    # Мгновенная скорость (чанки / время вызова)
     instant_speed: float = 0.0
-    # Скорость текущего вызова
+    # Скорость текущего вызова (completion_tokens / elapsed)
     call_speed: float = 0.0
 
 
 # Тип callback для live-обновлений во время стриминга.
 # Вызывается каждые ~0.5s с текущими промежуточными данными.
 ChunkCallback = Callable[
-    [int, float, float, Optional[float], str, float],
+    [int, float, Optional[float], str, float],
     None,
 ]
-# (chunk_count, instant_speed, avg_speed, ttft, content_tail, wall_elapsed)
+# (chunk_count, instant_speed, ttft, content_tail, wall_elapsed)
 
 
 class StreamSession:
     """Обёртка вокруг client.chat.completions.create(stream=True).
 
     Собирает метрики: токены, TTFT, мгновенную скорость, reasoning токены.
-    Калибрует tokens_per_chunk после каждого вызова.
+    Упрощение: 1 чанк ≈ 1 токен для live-оценок. Точные значения из usage.
 
     Args:
         client: OpenAI-compatible клиент.
-        tokens_per_chunk: Начальное соотношение (калибруется после 1-го вызова).
-        call_count: Номер текущего вызова (для калибровки).
         on_chunk: Callback для live-обновлений (опционально).
-        on_chunk_args: Дополнительные аргументы для callback (total_gen, start_time, worker_id).
+        on_chunk_args: Дополнительные аргументы для callback (start_time).
     """
 
     def __init__(
         self,
         client: OpenAI,
-        tokens_per_chunk: float = 1.0,
-        call_count: int = 0,
         on_chunk: Optional[ChunkCallback] = None,
         on_chunk_args: Optional[dict] = None,
     ) -> None:
         self.client = client
-        self.tokens_per_chunk = tokens_per_chunk
-        self.call_count = call_count
         self.on_chunk = on_chunk
         self.on_chunk_args = on_chunk_args or {}
 
@@ -144,17 +140,9 @@ class StreamSession:
                             wall_elapsed = time.time() - self.on_chunk_args.get(
                                 "start_time", turn_start
                             )
-                            total_gen = self.on_chunk_args.get("total_gen", 0)
-                            est_gen = total_gen + (chunk_count * self.tokens_per_chunk)
-                            avg_sp = (
-                                round(est_gen / wall_elapsed, 1)
-                                if wall_elapsed > 0
-                                else 0
-                            )
                             self.on_chunk(
                                 chunk_count,
                                 inst_sp,
-                                avg_sp,
                                 ttft,
                                 assistant_content[-100:],
                                 wall_elapsed,
@@ -166,7 +154,7 @@ class StreamSession:
         # TTFT
         ttft = (first_token_time - turn_start) if first_token_time is not None else None
 
-        # Мгновенная скорость
+        # Мгновенная скорость (чанки / время)
         inst_speed = self._instant_speed(instant_buffer)
 
         # Call speed
@@ -175,9 +163,6 @@ class StreamSession:
         # Fallback: если usage не пришло
         if completion_tokens == 0:
             completion_tokens = chunk_count
-
-        # Калибровка tokens_per_chunk
-        self._calibrate(chunk_count, completion_tokens)
 
         return StreamMetrics(
             completion_tokens=completion_tokens,
@@ -191,7 +176,10 @@ class StreamSession:
         )
 
     def _instant_speed(self, buffer: list[tuple[float, int]]) -> float:
-        """Мгновенная скорость на основе последних чанков из буфера."""
+        """Мгновенная скорость на основе последних чанков из буфера.
+
+        1 чанк ≈ 1 токен.
+        """
         if len(buffer) < 2:
             return 0.0
         win = min(5, len(buffer) - 1)
@@ -200,17 +188,5 @@ class StreamSession:
         c_start = buffer[-1 - win][1]
         c_end = buffer[-1][1]
         dt = t_end - t_start
-        dc = (c_end - c_start) * self.tokens_per_chunk
+        dc = c_end - c_start  # 1 чанк = 1 токен
         return round(dc / dt, 1) if dt > 0 else 0.0
-
-    def _calibrate(self, chunk_count: int, completion_tokens: int) -> None:
-        """Калибрует tokens_per_chunk после завершения вызова."""
-        if chunk_count > 0 and self.call_count == 0:
-            # Первый вызов -- точное соотношение
-            self.tokens_per_chunk = completion_tokens / chunk_count
-        elif chunk_count > 0:
-            # Экспоненциальное сглаживание
-            self.tokens_per_chunk = (
-                self.tokens_per_chunk * 0.7
-                + (completion_tokens / chunk_count) * 0.3
-            )

@@ -37,6 +37,8 @@ from .utils import (
 )
 from .cli_common import add_common_args, apply_config
 from .streaming import StreamSession
+from .live_table import BaseLiveTable
+from .worker_common import make_time_sender, make_on_chunk_callback, send_stats, send_error_stats
 
 
 def worker(  # type: ignore[reportInvalidTypeForm]
@@ -78,66 +80,23 @@ def worker(  # type: ignore[reportInvalidTypeForm]
         call_count = 0
         total_gen = 0
         total_chunks = 0  # кумулятивный счётчик чанков с момента старта воркера
-        history_tokens = 0
+        prompt_tokens = 0  # берётся из API usage после каждого вызова
         round_num = 1
         total_ttft = 0.0
         ttft_count = 0
 
         start_event.wait()  # Синхронизация старта
 
-        # --- Shared state для потока time_sender ---
-        from threading import Lock
-        _state_lock = Lock()
-        _state = {
-            'total_gen': 0,
-            'tokens_per_chunk': 1.0,
-            'chunk_count': 0,
-            'total_ttft': 0.0,
-        }
+        # --- Mutable references для shared callback'ов ---
+        total_gen_ref = [0]
+        total_chunks_ref = [0]
+        total_ttft_ref = [0.0]
 
         # --- Поток для обновления wall-time каждую секунду ---
-        def _time_sender():
-            while True:
-                time.sleep(1.0)
-                wall = time.time() - start_time
-                if wall > 0:
-                    with _state_lock:
-                        tg = _state['total_gen']
-                        tpc = _state['tokens_per_chunk']
-                        cc = _state['chunk_count']
-                    # Пересчитываем Avg с актуальным временем
-                    est_gen = tg + (cc * tpc)
-                    avg_sp = round(est_gen / wall, 1) if wall > 0 else 0
-                    q.put({
-                        "type": "time",
-                        "id": worker_id,
-                        "wall": format_time(wall),
-                        "avg": avg_sp,
-                    })
-
-        from threading import Thread
-        _time_thread = Thread(target=_time_sender, daemon=True)
-        _time_thread.start()
+        _time_thread = make_time_sender(q, worker_id, start_time, duration, None, None)
 
         # --- Callback для live-обновлений во время стриминга ---
-        def _on_chunk(chunk_count, inst_sp, avg_sp, ttft, tail, wall_elapsed):
-            # TTFT sum = накопленный до этого вызова + TTFT текущего (если уже есть)
-            current_ttft = ttft if ttft is not None else 0
-            ttft_sum_live = total_ttft + current_ttft
-
-            q.put({
-                "type": "live",
-                "id": worker_id,
-                "tail": tail,
-                "tok": chunk_count,
-                "est_tok": round(total_gen + (chunk_count * session.tokens_per_chunk)),
-                "chunks": total_chunks + chunk_count,
-                "inst": inst_sp,
-                "avg": avg_sp,
-                "ttft": ttft if ttft is not None else 0,
-                "ttft_sum": round(ttft_sum_live, 2),
-                "wall": format_time(wall_elapsed),
-            })
+        on_chunk = make_on_chunk_callback(q, worker_id, total_gen_ref, total_chunks_ref, total_ttft_ref, None)
 
         while duration is None or (time.time() - start_time < duration):
             # Уникальные промпты с ID воркера и раундом
@@ -147,33 +106,30 @@ def worker(  # type: ignore[reportInvalidTypeForm]
                 prompt_text = f"Поток {worker_id:07d} (раунд {round_num}) продолжай"
 
             # Проверка лимита контекста -- новый раунд
-            if history_tokens + total_gen >= MAX_CONTEXT_TOKENS:
+            if prompt_tokens + total_gen >= MAX_CONTEXT_TOKENS:
                 messages = [{"role": "system", "content": "Ты полезный помощник. Отвечай подробно и развёрнуто."}]
                 round_num += 1
                 call_count = 0
                 total_gen = 0
                 # total_chunks НЕ сбрасываем -- кумулятивный счётчик с момента старта
-                history_tokens = 0
+                prompt_tokens = 0
                 total_ttft = 0.0
                 ttft_count = 0
 
-            if history_tokens + total_gen >= _token_limit_warn():
+            if prompt_tokens + total_gen >= _token_limit_warn():
                 messages = truncate_history(messages)
 
             messages.append({"role": "user", "content": prompt_text})
 
-            turn_start = time.time()
             assistant_content = ""
             metrics = None
 
             try:
                 # Настройка callback для live-обновлений
-                session.on_chunk = _on_chunk
+                session.on_chunk = on_chunk
                 session.on_chunk_args = {
-                    "total_gen": total_gen,
                     "start_time": start_time,
                 }
-                session.call_count = call_count
 
                 # === Streaming через StreamSession ===
                 metrics = session.run(
@@ -198,28 +154,15 @@ def worker(  # type: ignore[reportInvalidTypeForm]
             if assistant_content and not assistant_content.startswith("[red]Error:"):
                 messages.append({"role": "assistant", "content": assistant_content})
 
-            elapsed = time.time() - turn_start
             call_count += 1
             wall_total = time.time() - start_time
 
             # Если ошибка в stream -- пропускаем
             if metrics is None:
-                q.put({
-                    "type": "stats",
-                    "id": worker_id,
-                    "calls": call_count,
-                    "p": history_tokens,
-                    "g": total_gen,
-                    "cg": 0,
-                    "total": history_tokens,
-                    "speed": 0,
-                    "avg_speed": 0,
-                    "inst_speed": 0,
-                    "ttft": 0,
-                    "tail": assistant_content[:80] if assistant_content else "error",
-                    "wall": format_time(wall_total),
-                    "round": round_num,
-                })
+                send_error_stats(
+                    q, worker_id, call_count, total_gen, wall_total,
+                    None, 0, assistant_content[:80] if assistant_content else "error",
+                )
                 continue
 
             completion_tokens = metrics.completion_tokens
@@ -227,22 +170,10 @@ def worker(  # type: ignore[reportInvalidTypeForm]
 
             # Защита: пустой ответ
             if completion_tokens == 0:
-                q.put({
-                    "type": "stats",
-                    "id": worker_id,
-                    "calls": call_count,
-                    "p": history_tokens,
-                    "g": total_gen,
-                    "cg": 0,
-                    "total": history_tokens,
-                    "speed": 0,
-                    "avg_speed": 0,
-                    "inst_speed": 0,
-                    "ttft": 0,
-                    "tail": "empty",
-                    "wall": format_time(wall_total),
-                    "round": round_num,
-                })
+                send_error_stats(
+                    q, worker_id, call_count, total_gen, wall_total,
+                    None, 0, "empty",
+                )
                 continue
 
             # TTFT
@@ -256,37 +187,24 @@ def worker(  # type: ignore[reportInvalidTypeForm]
             total_gen += completion_tokens
             total_chunks += chunk_count
 
-            # Обновляем shared state для потока time_sender
-            with _state_lock:
-                _state['total_gen'] = total_gen
-                _state['tokens_per_chunk'] = session.tokens_per_chunk
-                _state['total_ttft'] = total_ttft
-                _state['chunk_count'] = 0  # сброс для нового вызова
+            # Обновляем mutable references для callback'ов
+            total_gen_ref[0] = total_gen
+            total_chunks_ref[0] = total_chunks
+            total_ttft_ref[0] = total_ttft
 
-            avg_speed = total_gen / wall_total if wall_total > 0 else 0
+            # Обновляем prompt_tokens из API (точное значение)
+            prompt_tokens = metrics.prompt_tokens
 
             # Отправляем финальную статистику
-            q.put({
-                "type": "stats",
-                "id": worker_id,
-                "calls": call_count,
-                "p": history_tokens,
-                "g": total_gen,
-                "cg": completion_tokens,
-                "chunks": total_chunks,
-                "est_gen": total_gen,  # после стрима = точное значение
-                "total": history_tokens + completion_tokens,
-                "speed": round(metrics.call_speed, 1),
-                "avg_speed": round(avg_speed, 1),
-                "inst_speed": round(metrics.instant_speed, 1),
-                "ttft": round(turn_ttft, 2),
-                "ttft_sum": round(total_ttft, 2),
-                "tail": assistant_content[-80:] if assistant_content else "",
-                "wall": format_time(wall_total),
-                "round": round_num,
-            })
+            send_stats(
+                q, worker_id, call_count, metrics, total_gen, total_chunks, total_ttft,
+                wall_total, None, 0, assistant_content[-80:] if assistant_content else "",
+                round_num=round_num,
+                prompt_tokens=prompt_tokens,
+                total_tokens=prompt_tokens + total_gen,
+            )
 
-    except Exception as e:
+    except Exception:  # noqa: BLE001
         # Ловим ошибки на уровне воркера
         q.put({
             "type": "error",
@@ -299,30 +217,16 @@ def worker(  # type: ignore[reportInvalidTypeForm]
 # Rich Live Table
 # ---------------------------------------------------------------------------
 
-class LiveTable:
-    """Живая таблица для Rich Live display.
+class LiveTable(BaseLiveTable):
+    """Живая таблица для bench_multi с расширенным набором колонок.
 
-    ОДИН словарь на воркер -- все обновления пишут в него, рендер читает из него.
+    Наследует управление данными из BaseLiveTable (update_stats, update_live,
+    update_time, mark_error, mark_stopped, _clean_tail). Реализует render()
+    с собственным набором колонок, специфичным для multi-режима.
     """
 
-    def __init__(self, duration, total_workers, response_width=60):
-        self.duration = duration
-        self.total_workers = total_workers
-        self.response_width = response_width
-        self.workers = {}     # {id: {round, calls, prompt, gen, gen_est, chunks,
-                              #        call_gen, total, speed, avg, ttft, ttft_sum,
-                              #        wall, tail}}
-        self._errors = {}     # {id: traceback}
-        self.console = Console()
-
-    @staticmethod
-    def _merge(w, data):
-        """Merge non-None values from data into worker dict w."""
-        for k, v in data.items():
-            if v is not None:
-                w[k] = v
-
-    def mark_started(self, worker_id, long_context=False):
+    def mark_started(self, worker_id: int, long_context: bool = False) -> None:
+        """Инициализирует данные воркера при старте."""
         self.workers[worker_id] = {
             "round": 1, "calls": 0, "prompt": 0, "gen": 0,
             "gen_est": 0, "chunks": 0, "call_gen": 0, "total": 0,
@@ -331,224 +235,21 @@ class LiveTable:
             "long_context": long_context,
         }
 
-    def update_stats(self, msg):
+    def update_stats(self, msg: dict) -> None:
+        """Расширенная версия: добавляет round, prompt, total."""
+        super().update_stats(msg)
         w = self.workers.setdefault(msg["id"], {})
         self._merge(w, {
             "round": msg.get("round"),
-            "calls": msg.get("calls"),
             "prompt": msg.get("p"),
-            "gen": msg.get("g"),
-            "gen_est": msg.get("est_gen"),
-            "chunks": msg.get("chunks"),
-            "call_gen": msg.get("cg"),
             "total": msg.get("total"),
-            "speed": msg.get("inst_speed"),
-            "avg": msg.get("avg_speed"),
-            "ttft": msg.get("ttft"),
-            "ttft_sum": msg.get("ttft_sum"),
-            "wall": msg.get("wall"),
-            "tail": msg.get("tail"),
         })
 
-    def update_live(self, msg):
-        w = self.workers.setdefault(msg["id"], {})
-        self._merge(w, {
-            "speed": msg.get("inst"),
-            "avg": msg.get("avg"),
-            "ttft": msg.get("ttft"),
-            "ttft_sum": msg.get("ttft_sum"),
-            "gen_est": msg.get("est_tok"),
-            "chunks": msg.get("chunks"),
-            "wall": msg.get("wall"),
-            "tail": msg.get("tail"),
-        })
+    def __rich__(self) -> Table:
+        """Rich-совместимый интерфейс для Live display."""
+        return self.render()
 
-    def update_time(self, msg):
-        w = self.workers.setdefault(msg["id"], {})
-        self._merge(w, {
-            "wall": msg.get("wall"),
-            "avg": msg.get("avg"),
-        })
-
-    def mark_error(self, worker_id, traceback_str):
-        self._errors[worker_id] = traceback_str
-
-    def mark_stopped(self, worker_id, error_msg):
-        """Воркер остановлен из-за ошибки."""
-        w = self.workers.setdefault(worker_id, {})
-        w["stopped"] = True
-        w["error"] = error_msg
-
-    def _clean_tail(self, tail):
-        """Очищает и обрезает текст ответа для колонки Response.
-
-        Заменяет wide-символы (CJK, эмодзи, пиктограммы -- 2+ ячейки) на точки,
-        так как они ломают ширину колонки. Кириллица, латиница и другие
-        1-ячеечные символы сохраняются.
-        """
-        if not tail:
-            return tail
-
-        # Проверяем, является ли символ wide (2+ ячейки в терминале)
-        def is_wide(c):
-            cp = ord(c)
-            # CJK Unified Ideographs и расширения
-            if 0x4E00 <= cp <= 0x9FFF:
-                return True
-            if 0x3400 <= cp <= 0x4DBF:
-                return True
-            if 0x20000 <= cp <= 0x2A6DF:
-                return True
-            if 0x2A700 <= cp <= 0x2B73F:
-                return True
-            if 0x2B740 <= cp <= 0x2B81F:
-                return True
-            if 0x2B820 <= cp <= 0x2CEAF:
-                return True
-            if 0xF900 <= cp <= 0xFAFF:
-                return True
-            if 0x2F800 <= cp <= 0x2FA1F:
-                return True
-            # CJK symbols and punctuation
-            if 0x3000 <= cp <= 0x303F:
-                return True
-            if 0xFF01 <= cp <= 0xFF60:
-                return True
-            # Hangul
-            if 0xAC00 <= cp <= 0xD7AF:
-                return True
-            if 0xD7B0 <= cp <= 0xD7FF:
-                return True
-            # Katakana/Hiragana (некоторые wide)
-            if 0x30A0 <= cp <= 0x30FF:
-                return True
-            if 0x3040 <= cp <= 0x309F:
-                return True
-            # Бамбу/Тай/Гуарани и другие SE-Asian
-            if 0x0E01 <= cp <= 0x0E3E:
-                return True
-            if 0x0E40 <= cp <= 0x0E4E:
-                return True
-            # Эмодзи и другие supplementary symbols (2 ячейки)
-            if cp >= 0x1F000:
-                return True
-            if 0x1F300 <= cp <= 0x1F9FF:
-                return True
-            if 0x1FA00 <= cp <= 0x1FA6F:
-                return True
-            if 0x1FA70 <= cp <= 0x1FAFF:
-                return True
-            if 0x2600 <= cp <= 0x26FF:  # Misc Symbols
-                return True
-            if 0x2700 <= cp <= 0x27BF:  # Dingbats
-                return True
-            if 0x2300 <= cp <= 0x23FF:  # Misc Technical
-                return True
-            if 0xFE00 <= cp <= 0xFE0F:  # Variation selectors -- skip
-                return False
-            if 0xFE30 <= cp <= 0xFE4F:
-                return True
-            if 0x2000 <= cp <= 0x206F:  # General punctuation -- narrow
-                return False
-            return False
-
-        # --- Проходим по строке, заменяя wide символы ---
-        clean = ""
-        in_tag = False
-        for c in tail:
-            if c == '[':
-                in_tag = True
-                clean += c
-                continue
-            if c == ']' and in_tag:
-                in_tag = False
-                clean += c
-                continue
-            if in_tag:
-                clean += c
-                continue
-            # Вне тега: заменяем проблемные символы
-            if c == '\n' or c == '\r' or c == '\t':
-                clean += " "
-            elif c.isprintable() and not is_wide(c):
-                clean += c
-            else:
-                clean += "."
-
-        # Схлопываем множественные пробелы (только вне тегов)
-        prev = None
-        while prev != clean:
-            prev = clean
-            result = ""
-            in_tag = False
-            prev_space = False
-            for c in prev:
-                if c == '[':
-                    in_tag = True
-                    result += c
-                    prev_space = False
-                    continue
-                if c == ']' and in_tag:
-                    in_tag = False
-                    result += c
-                    prev_space = False
-                    continue
-                if in_tag:
-                    result += c
-                    prev_space = False
-                    continue
-                if c == ' ' and prev_space:
-                    continue
-                prev_space = (c == ' ')
-                result += c
-            clean = result
-
-        clean = clean.strip()
-        if not clean:
-            return tail
-
-        # --- Обрезаем до ширины колонки (считаем только видимые символы) ---
-        def visual_length(s):
-            length = 0
-            in_t = False
-            for ch in s:
-                if ch == '[':
-                    in_t = True
-                    continue
-                if ch == ']' and in_t:
-                    in_t = False
-                    continue
-                if not in_t:
-                    length += 1
-            return length
-
-        vlen = visual_length(clean)
-        max_vlen = self.response_width - 3  # место под "..."
-        if vlen > max_vlen:
-            truncated = ""
-            count = 0
-            in_t = False
-            for ch in clean:
-                if ch == '[':
-                    in_t = True
-                    truncated += ch
-                    continue
-                if ch == ']' and in_t:
-                    in_t = False
-                    truncated += ch
-                    continue
-                if in_t:
-                    truncated += ch
-                    continue
-                if count >= max_vlen:
-                    break
-                count += 1
-                truncated += ch
-            clean = "..." + truncated
-
-        return clean
-
-    def __rich__(self):
+    def render(self) -> Table:
         """Рендерит таблицу для Rich Live."""
         now = datetime.now().strftime("%H:%M:%S")
         dur_str = f"{self.duration}s" if self.duration is not None else "\u221e"
@@ -558,12 +259,13 @@ class LiveTable:
             f"Duration: {dur_str} | "
             f"Model: {MODEL}"
         )
+
         table = Table(
             box=DOUBLE,
             show_header=True,
             title=f"[bold cyan]LLM Speed Benchmark (MULTI)[/] [dim]{now} -- {info}[/]",
             title_style="cyan",
-            caption="[dim]Gen = точные токены (usage) | Gen est = оценка (Gen + чанки_в_вызове x tokens_per_chunk, после стрима = Gen) | Chunks = всего чанков с начала воркера | CallGen = в последнем вызове | Speed = скорость последних 5 чанков | Avg = Gen est / время_воркера (обновляется каждую сек) | TTFT = последний вызов | TTFT sum = суммарный TTFT всех вызовов[/]",
+            caption="[dim]Gen = точные токены (usage) | Gen est = оценка (Gen + чанки_в_вызове, 1 чанк ≈ 1 токен, после стрима = Gen) | Chunks = всего чанков с начала воркера | CallGen = в последнем вызове | Speed = чанки / время_вызова | Avg = Gen est / время_воркера | TTFT = последний вызов | TTFT sum = суммарный TTFT всех вызовов[/]",
             caption_style="dim",
             padding=(0, 1),
             highlight=True
@@ -586,7 +288,7 @@ class LiveTable:
         table.add_column("Time", width=6, justify="center")
         table.add_column("Response", width=self.response_width, overflow="fold")
 
-        # --- Строки воркеров -- ОДНА ветка ---
+        # --- Строки воркеров ---
         for wid in range(self.total_workers):
             wid_str = str(wid)
 

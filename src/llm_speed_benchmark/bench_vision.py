@@ -35,10 +35,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
-from rich.console import Console
 from rich.live import Live
 from rich.table import Table
-from rich.box import DOUBLE
 
 from .utils import (
     API_KEY,
@@ -59,47 +57,35 @@ from .image_utils import (
     generate_test_videos,
     sawtooth_image_count,
 )
+from .live_table import BaseLiveTable
+from .worker_common import make_time_sender, make_on_chunk_callback, send_stats, send_error_stats
 
 
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
-def _worker(  # type: ignore[reportInvalidTypeForm]
+def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
     worker_id: int,
-    q: "Queue",  # type: ignore[reportInvalidTypeForm]
-    start_event: "Event",  # type: ignore[reportInvalidTypeForm]
+    q: "Queue",  # type: ignore[reportInvalidTypeForm, valid-type]
+    start_event: "Event",  # type: ignore[reportInvalidTypeForm, valid-type]
     media_paths: List[str],
     duration: Optional[int],
     prompts: List[str],
     max_images: int,
     skip_errors: bool = False,
     video_mode: bool = False,
-    max_videos: int = 1,
+    max_videos: int = 0,
 ) -> None:
-    """Воркер: загружает медиа (изображения или видео) и отправляет модели.
+    """Worker: loads media (images or videos) and sends to the model.
 
-    В режиме изображений — циклически проходит по всем изображениям, используя
-    разные промпты. Количество изображений в запросе меняется по
-    пиломобразному паттерну: max, max-1, ..., 1, 2, ..., max-1.
+    In image mode -- cycles through all images using different prompts.
+    The number of images per request follows a sawtooth pattern:
+    max, max-1, ..., 1, 2, ..., max-1.
 
-    В режиме видео — аналогично, количество видео в запросе меняется по
-    пиломобразному паттерну: max_videos, max_videos-1, ..., 1, 2, ..., max_videos-1.
+    In video mode -- same pattern with videos.
 
-    При ошибке воркер останавливается (skip_errors=False) или продолжает
-    со следующим запросом (skip_errors=True).
-
-    Args:
-        worker_id: ID воркера.
-        q: Queue для сообщений.
-        start_event: Event для синхронизации старта.
-        media_paths: Пути к медиа (изображения или видео).
-        duration: Длительность в секундах (None = без ограничения).
-        prompts: Список промптов для ротации.
-        max_images: Максимум изображений в одном запросе.
-        skip_errors: Если True — продолжать после ошибки.
-        video_mode: Если True — отправлять видео вместо изображений.
-        max_videos: Максимум видео в одном запросе (пилообразный паттерн).
+    Stops on error (skip_errors=False) or continues (skip_errors=True).
     """
     try:
         client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=600.0)
@@ -115,66 +101,30 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
         ttft_count = 0
         media_index = 0
         prompt_index = 0
-        current_count = 1  # для live callback (images или 1 video)
+        current_count = 1
 
-        # Shared state для потока time_sender
-        from threading import Lock, Thread
+        # Mutable references for shared callbacks
+        total_gen_ref = [0]
+        total_chunks_ref = [0]
+        total_ttft_ref = [0.0]
+        media_count_ref = [0]
+
+        # Shared state for time-sender thread
+        from threading import Lock
 
         _state_lock = Lock()
         _state: Dict[str, Any] = {
             "total_gen": 0,
-            "tokens_per_chunk": 1.0,
             "chunk_count": 0,
         }
 
-        def _time_sender() -> None:
-            while True:
-                time.sleep(1.0)
-                wall = time.time() - start_time
-                if wall > 0:
-                    with _state_lock:
-                        tg = _state["total_gen"]
-                        tpc = _state["tokens_per_chunk"]
-                        cc = _state["chunk_count"]
-                    est_gen = tg + (cc * tpc)
-                    avg_sp = round(est_gen / wall, 1) if wall > 0 else 0
-                    q.put({
-                        "type": "time",
-                        "id": worker_id,
-                        "wall": format_time(wall),
-                        "avg": avg_sp,
-                    })
+        _time_thread = make_time_sender(q, worker_id, start_time, duration, _state, _state_lock)
 
-        _time_thread = Thread(target=_time_sender, daemon=True)
-        _time_thread.start()
-
-        # Callback для live-обновлений
-        def _on_chunk(
-            chunk_count: int,
-            inst_sp: float,
-            avg_sp: float,
-            ttft: Optional[float],
-            tail: str,
-            wall_elapsed: float,
-        ) -> None:
-            current_ttft = ttft if ttft is not None else 0
-            ttft_sum_live = total_ttft + current_ttft
-            media_name = Path(media_paths[media_index % len(media_paths)]).stem
-            q.put({
-                "type": "live",
-                "id": worker_id,
-                "tail": tail,
-                "tok": chunk_count,
-                "est_tok": round(total_gen + (chunk_count * session.tokens_per_chunk)),
-                "chunks": total_chunks + chunk_count,
-                "inst": inst_sp,
-                "avg": avg_sp,
-                "ttft": ttft if ttft is not None else 0,
-                "ttft_sum": round(ttft_sum_live, 2),
-                "wall": format_time(wall_elapsed),
-                "media": media_name,
-                "media_count": current_count,
-            })
+        _on_chunk = make_on_chunk_callback(
+            q, worker_id, total_gen_ref, total_chunks_ref, total_ttft_ref,
+            lambda: Path(media_paths[media_index % len(media_paths)]).stem,
+            media_count_ref=media_count_ref,
+        )
 
         start_event.wait()
 
@@ -185,7 +135,6 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
             wall_total = time.time() - start_time
 
             if video_mode:
-                # Видео: пиломобразный паттерн
                 num_media = sawtooth_image_count(call_count, max_videos)
                 num_media = min(num_media, len(media_paths))
                 current_count = num_media
@@ -194,7 +143,6 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                     for i in range(num_media)
                 ]
             else:
-                # Изображения: пилообразный паттерн
                 num_media = sawtooth_image_count(call_count, max_images)
                 num_media = min(num_media, len(media_paths))
                 current_count = num_media
@@ -205,7 +153,6 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
 
             prompt = prompts[prompt_index % len(prompts)]
 
-            # Строим message (image или video)
             if video_mode:
                 messages = build_video_message(selected_media, prompt)
             else:
@@ -215,12 +162,12 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
             metrics = None
 
             try:
+                # Обновляем media_count перед вызовом
+                media_count_ref[0] = current_count
                 session.on_chunk = _on_chunk
                 session.on_chunk_args = {
-                    "total_gen": total_gen,
                     "start_time": start_time,
                 }
-                session.call_count = call_count
 
                 metrics = session.run(
                     messages=messages,
@@ -238,30 +185,17 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
                         "calls": call_count,
                         "wall": format_time(time.time() - start_time),
                     })
-                    # Воркер останавливается
                     break
                 assistant_content = error_msg
 
             call_count += 1
             wall_total = time.time() - start_time
+            media_name = Path(selected_media[0]).stem
 
-            # Если ошибка в stream
             if metrics is None:
-                q.put({
-                    "type": "stats",
-                    "id": worker_id,
-                    "calls": call_count,
-                    "media": Path(selected_media[0]).stem,
-                    "media_count": current_count,
-                    "g": total_gen,
-                    "cg": 0,
-                    "speed": 0,
-                    "avg_speed": 0,
-                    "inst_speed": 0,
-                    "ttft": 0,
-                    "tail": assistant_content[:80] if assistant_content else "error",
-                    "wall": format_time(wall_total),
-                })
+                send_error_stats(q, worker_id, call_count, total_gen, wall_total,
+                                 media_name, current_count,
+                                 assistant_content[:80] if assistant_content else "error")
                 media_index += current_count
                 prompt_index += 1
                 continue
@@ -269,28 +203,13 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
             completion_tokens = metrics.completion_tokens
             chunk_count = metrics.chunk_count
 
-            # Пустой ответ
             if completion_tokens == 0:
-                q.put({
-                    "type": "stats",
-                    "id": worker_id,
-                    "calls": call_count,
-                    "media": Path(selected_media[0]).stem,
-                    "media_count": current_count,
-                    "g": total_gen,
-                    "cg": 0,
-                    "speed": 0,
-                    "avg_speed": 0,
-                    "inst_speed": 0,
-                    "ttft": 0,
-                    "tail": "empty",
-                    "wall": format_time(wall_total),
-                })
+                send_error_stats(q, worker_id, call_count, total_gen, wall_total,
+                                 media_name, current_count, "empty")
                 media_index += current_count
                 prompt_index += 1
                 continue
 
-            # TTFT
             if metrics.ttft is not None:
                 turn_ttft = metrics.ttft
                 total_ttft += turn_ttft
@@ -301,33 +220,17 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
             total_gen += completion_tokens
             total_chunks += chunk_count
 
-            # Обновляем shared state
+            total_gen_ref[0] = total_gen
+            total_chunks_ref[0] = total_chunks
+            total_ttft_ref[0] = total_ttft
+
             with _state_lock:
                 _state["total_gen"] = total_gen
-                _state["tokens_per_chunk"] = session.tokens_per_chunk
                 _state["chunk_count"] = 0
 
-            avg_speed = total_gen / wall_total if wall_total > 0 else 0
-
-            # Финальная статистика
-            q.put({
-                "type": "stats",
-                "id": worker_id,
-                "calls": call_count,
-                "media": Path(selected_media[0]).stem,
-                "media_count": current_count,
-                "g": total_gen,
-                "cg": completion_tokens,
-                "chunks": total_chunks,
-                "est_gen": total_gen,
-                "speed": round(metrics.call_speed, 1),
-                "avg_speed": round(avg_speed, 1),
-                "inst_speed": round(metrics.instant_speed, 1),
-                "ttft": round(turn_ttft, 2),
-                "ttft_sum": round(total_ttft, 2),
-                "tail": assistant_content[-80:] if assistant_content else "",
-                "wall": format_time(wall_total),
-            })
+            send_stats(q, worker_id, call_count, metrics, total_gen, total_chunks,
+                       total_ttft, wall_total, media_name, current_count,
+                       assistant_content[-80:] if assistant_content else "")
 
             media_index += current_count
             prompt_index += 1
@@ -344,8 +247,8 @@ def _worker(  # type: ignore[reportInvalidTypeForm]
 # Live Table
 # ---------------------------------------------------------------------------
 
-class VisionLiveTable:
-    """Rich Live таблица для vision-бенчмарка."""
+class VisionLiveTable(BaseLiveTable):
+    """Rich Live table for vision benchmark (images or video)."""
 
     def __init__(
         self,
@@ -354,19 +257,8 @@ class VisionLiveTable:
         response_width: int = 60,
         video_mode: bool = False,
     ) -> None:
-        self.duration = duration
-        self.total_workers = total_workers
-        self.response_width = response_width
+        super().__init__(duration, total_workers, response_width)
         self.video_mode = video_mode
-        self.workers: Dict[int, Dict[str, Any]] = {}
-        self._errors: Dict[int, str] = {}
-        self.console = Console()
-
-    @staticmethod
-    def _merge(w: Dict[str, Any], data: Dict[str, Any]) -> None:
-        for k, v in data.items():
-            if v is not None:
-                w[k] = v
 
     def mark_started(self, worker_id: int, media_count: int = 0) -> None:
         self.workers[worker_id] = {
@@ -387,193 +279,31 @@ class VisionLiveTable:
         }
 
     def update_stats(self, msg: Dict[str, Any]) -> None:
-        w = self.workers.setdefault(msg["id"], {})
+        super().update_stats(msg)
+        w = self.workers[msg["id"]]
         self._merge(w, {
-            "calls": msg.get("calls"),
-            "media": msg.get("media") or msg.get("img"),
-            "media_count": msg.get("media_count") or msg.get("img_count"),
-            "gen": msg.get("g"),
-            "gen_est": msg.get("est_gen"),
-            "chunks": msg.get("chunks"),
-            "call_gen": msg.get("cg"),
-            "speed": msg.get("inst_speed"),
-            "avg": msg.get("avg_speed"),
-            "ttft": msg.get("ttft"),
-            "ttft_sum": msg.get("ttft_sum"),
-            "wall": msg.get("wall"),
-            "tail": msg.get("tail"),
+            "media": msg.get("media") or msg.get("img", ""),
+            "media_count": msg.get("media_count", msg.get("img_count", 0)),
         })
 
     def update_live(self, msg: Dict[str, Any]) -> None:
-        w = self.workers.setdefault(msg["id"], {})
+        super().update_live(msg)
+        w = self.workers[msg["id"]]
         self._merge(w, {
-            "speed": msg.get("inst"),
-            "avg": msg.get("avg"),
-            "ttft": msg.get("ttft"),
-            "ttft_sum": msg.get("ttft_sum"),
-            "gen_est": msg.get("est_tok"),
-            "chunks": msg.get("chunks"),
-            "wall": msg.get("wall"),
-            "tail": msg.get("tail"),
             "media": msg.get("media") or msg.get("img", ""),
-            "media_count": msg.get("media_count") or msg.get("img_count", 0),
         })
-
-    def update_time(self, msg: Dict[str, Any]) -> None:
-        w = self.workers.setdefault(msg["id"], {})
-        self._merge(w, {
-            "wall": msg.get("wall"),
-            "avg": msg.get("avg"),
-        })
-
-    def mark_error(self, worker_id: int, traceback_str: str) -> None:
-        self._errors[worker_id] = traceback_str
-
-    def mark_stopped(self, worker_id: int, error_msg: str) -> None:
-        """Воркер остановлен из-за ошибки."""
-        w = self.workers.setdefault(worker_id, {})
-        w["stopped"] = True
-        w["error"] = error_msg
-
-    @staticmethod
-    def _clean_tail(tail: str, max_len: int = 60) -> str:
-        """Очищает текст для отображения в таблице."""
-        if not tail:
-            return tail
-        # Убираем wide символы и новые строки
-        clean = ""
-        in_tag = False
-        for c in tail:
-            if c == "[":
-                in_tag = True
-                clean += c
-                continue
-            if c == "]" and in_tag:
-                in_tag = False
-                clean += c
-                continue
-            if in_tag:
-                clean += c
-                continue
-            cp = ord(c)
-            if cp >= 0x4E00 and cp <= 0x9FFF:
-                clean += "."
-            elif c in "\n\r\t":
-                clean += " "
-            elif c.isprintable():
-                clean += c
-            else:
-                clean += "."
-        # Схлопываем пробелы
-        prev = None
-        while prev != clean:
-            prev = clean
-            parts = []
-            in_tag = False
-            prev_space = False
-            for c in prev:
-                if c == "[":
-                    in_tag = True
-                    parts.append(c)
-                    prev_space = False
-                    continue
-                if c == "]" and in_tag:
-                    in_tag = False
-                    parts.append(c)
-                    prev_space = False
-                    continue
-                if in_tag:
-                    parts.append(c)
-                    prev_space = False
-                    continue
-                if c == " " and prev_space:
-                    continue
-                prev_space = c == " "
-                parts.append(c)
-            clean = "".join(parts)
-        clean = clean.strip()
-        if len(clean) > max_len:
-            clean = clean[:max_len - 3] + "..."
-        return clean
+        # Only update media_count if explicitly present in the live message
+        if "media_count" in msg:
+            w["media_count"] = msg["media_count"]
 
     def render(self) -> Table:
-        table = Table(box=DOUBLE, show_header=True)
-
-        table.add_column("W#", style="cyan", width=4, justify="right")
-        table.add_column("Calls", style="magenta", width=6, justify="right")
         if self.video_mode:
-            table.add_column("Vid", style="bold yellow", width=5, justify="right")
-            table.add_column("Video", style="green", width=14)
+            table = self._make_media_table("Vid", "Video")
         else:
-            table.add_column("Imgs", style="bold yellow", width=5, justify="right")
-            table.add_column("Image", style="green", width=14)
-        table.add_column("Gen", style="yellow", width=8, justify="right")
-        table.add_column("Call", style="white", width=7, justify="right")
-        table.add_column("Speed", style="bold green", width=9, justify="right")
-        table.add_column("Avg", style="bold blue", width=8, justify="right")
-        table.add_column("TTFT", style="red", width=8, justify="right")
-        table.add_column("TTFT sum", style="red", width=10, justify="right")
-        table.add_column("Wall", style="dim", width=7, justify="right")
-        table.add_column("Response", style="dim white", width=self.response_width)
+            table = self._make_media_table("Imgs", "Image")
 
         for wid in sorted(self.workers.keys()):
-            w = self.workers[wid]
-            err = self._errors.get(wid)
-
-            if err:
-                table.add_row(
-                    str(wid),
-                    str(w.get("calls", 0)),
-                    "",
-                    "",
-                    "ERROR",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "[red]SEE LOG[/]",
-                )
-                continue
-
-            if w.get("stopped"):
-                error_text = self._clean_tail(w.get("error", "unknown"), self.response_width)
-                table.add_row(
-                    str(wid),
-                    str(w.get("calls", 0)),
-                    "",
-                    "",
-                    "STOPPED",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    f"[red]{error_text}[/]",
-                )
-                continue
-
-            gen_val = w.get("gen_est", w.get("gen", 0))
-            tail = self._clean_tail(w.get("tail", ""), self.response_width)
-            media_name = w.get("media", "")
-            media_count = w.get("media_count", 0)
-
-            table.add_row(
-                str(wid),
-                str(w.get("calls", 0)),
-                str(media_count),
-                media_name,
-                f"{gen_val:,}",
-                f"{w.get('call_gen', 0):,}",
-                f"{w.get('speed', 0):.1f} t/s",
-                f"{w.get('avg', 0):.1f} t/s",
-                f"{w.get('ttft', 0):.2f}s",
-                f"{w.get('ttft_sum', 0):.1f}s",
-                w.get("wall", ""),
-                tail,
-            )
+            self._render_worker_row(table, wid, self.workers[wid], media=True)
 
         return table
 
@@ -591,7 +321,7 @@ def run_benchmark(
     images_dir: Optional[str] = None,
     videos_dir: Optional[str] = None,
     max_images: int = 1,
-    max_videos: int = 1,
+    max_videos: int = 0,
     skip_errors: bool = False,
     response_width: int = 60,
     prompts: Optional[List[str]] = None,
@@ -626,9 +356,9 @@ def run_benchmark(
             prompts = list(DEFAULT_PROMPTS)
 
     # --- Подготовка медиа ---
+    media_paths: List[str] = []
     if video_mode:
         temp_dir = Path(os.path.expanduser("~/.llm-speed-benchmark/tmp/vision_videos"))
-        media_paths: List[str] = []
 
         if videos_dir is not None:
             found = discover_videos(videos_dir)
@@ -656,7 +386,6 @@ def run_benchmark(
                     sys.exit(1)
     else:
         temp_dir = Path(os.path.expanduser("~/.llm-speed-benchmark/tmp/vision_images"))
-        media_paths: List[str] = []
 
         if images_dir is not None:
             found = discover_images(images_dir)
@@ -843,8 +572,8 @@ def cli() -> None:
         help="Максимум изображений в одном запросе (пилообразный паттерн: N..1..N-1). По умолчанию: 1",
     )
     parser.add_argument(
-        "--max-videos", type=int, default=1,
-        help="Максимум видео в одном запросе (пилообразный паттерн: N..1..N-1). По умолчанию: 1",
+        "--max-videos", type=int, default=0,
+        help="Максимум видео в одном запросе (пилообразный паттерн: N..1..N-1). По умолчанию: 0",
     )
     parser.add_argument(
         "--skip-errors", action="store_true", default=False,
@@ -853,8 +582,8 @@ def cli() -> None:
 
     args = parser.parse_args()
 
-    # Видео-режим включается если указан --videos или --max-videos >= 1
-    video_mode = args.videos is not None or args.max_videos >= 1
+    # Видео-режим включается если указан --videos или --max-videos > 0
+    video_mode = args.videos is not None or args.max_videos > 0
 
     prompts = args.prompt if args.prompt else None
 

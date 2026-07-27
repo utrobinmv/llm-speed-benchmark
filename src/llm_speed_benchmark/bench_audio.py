@@ -18,30 +18,30 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
-from rich.console import Console
 from rich.live import Live
 from rich.table import Table
-from rich.table import box as _rich_box
 
-from llm_speed_benchmark.audio_utils import (
+from .audio_utils import (
     DEFAULT_AUDIO_PROMPTS,
     build_audio_message,
     discover_audio,
     get_audio_paths,
 )
-from llm_speed_benchmark.cli_common import add_common_args, apply_config
-from llm_speed_benchmark.streaming import StreamSession
-from llm_speed_benchmark.utils import format_time
+from .cli_common import add_common_args, apply_config
+from .streaming import StreamSession
+from .utils import format_time
+from .live_table import BaseLiveTable
+from .worker_common import make_time_sender, make_on_chunk_callback, send_stats, send_error_stats
 
 
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
-def _worker(
+def _worker(  # type: ignore[valid-type]
     worker_id: int,
-    q: Queue,
-    start_event: Event,
+    q: Queue,  # type: ignore[valid-type]
+    start_event: Event,  # type: ignore[valid-type]
     audio_paths: List[str],
     duration: Optional[int],
     prompts: List[str],
@@ -49,18 +49,18 @@ def _worker(
     skip_errors: bool,
     response_width: int,
 ) -> None:
-    """Воркер для аудио-бенчмарка.
+    """Worker for audio benchmark.
 
     Args:
-        worker_id: ID воркера.
-        q: Очередь для сообщений.
-        start_event: Событие синхронизации старта.
-        audio_paths: Пути к аудио файлам.
-        duration: Длительность в секундах (None = без ограничения).
-        prompts: Промпты для запросов.
-        max_audio: Максимум аудио в одном запросе.
-        skip_errors: Продолжать после ошибки.
-        response_width: Ширина колонки Response.
+        worker_id: Worker ID.
+        q: Message queue.
+        start_event: Start synchronization event.
+        audio_paths: Paths to audio files.
+        duration: Duration in seconds (None = unlimited).
+        prompts: Prompts for requests.
+        max_audio: Max audio files per request.
+        skip_errors: Continue after error.
+        response_width: Response column width.
     """
     import llm_speed_benchmark.utils as _u  # noqa: PLC0414
 
@@ -86,54 +86,19 @@ def _worker(
     audio_index = 0
     prompt_index = 0
 
-    def _time_sender() -> None:
-        while True:
-            if duration is not None:
-                elapsed = time.time() - start_time
-                if elapsed >= duration:
-                    break
-            time.sleep(1)
-            wall = time.time() - start_time
-            est_gen = total_gen
-            avg_sp = round(est_gen / wall, 1) if wall > 0 else 0
-            q.put({
-                "type": "time",
-                "id": worker_id,
-                "wall": format_time(wall),
-                "avg": avg_sp,
-            })
+    # Mutable refs for shared callback
+    total_gen_ref: list[int] = [0]
+    total_chunks_ref: list[int] = [0]
+    total_ttft_ref: list[float] = [0.0]
+    media_count_ref: list[int] = [0]
 
-    _time_thread = __import__("threading", fromlist=["Thread"]).Thread(
-        target=_time_sender, daemon=True
+    _time_thread = make_time_sender(q, worker_id, start_time, duration)
+
+    _on_chunk = make_on_chunk_callback(
+        q, worker_id, total_gen_ref, total_chunks_ref, total_ttft_ref,
+        lambda: Path(audio_paths[audio_index % len(audio_paths)]).stem,
+        media_count_ref=media_count_ref,
     )
-    _time_thread.start()
-
-    def _on_chunk(
-        chunk_count: int,
-        inst_sp: float,
-        avg_sp: float,
-        ttft: Optional[float],
-        tail: str,
-        wall_elapsed: float,
-    ) -> None:
-        current_ttft = ttft if ttft is not None else 0
-        ttft_sum_live = total_ttft + current_ttft
-        audio_name = Path(audio_paths[audio_index % len(audio_paths)]).stem
-        q.put({
-            "type": "live",
-            "id": worker_id,
-            "tail": tail,
-            "tok": chunk_count,
-            "est_tok": round(total_gen + (chunk_count * session.tokens_per_chunk)),
-            "chunks": total_chunks + chunk_count,
-            "inst": inst_sp,
-            "avg": avg_sp,
-            "ttft": ttft if ttft is not None else 0,
-            "ttft_sum": round(ttft_sum_live, 2),
-            "wall": format_time(wall_elapsed),
-            "media": audio_name,
-            "media_count": 1,
-        })
 
     start_event.wait()
 
@@ -155,12 +120,12 @@ def _worker(
             metrics = None
 
             try:
+                # Обновляем media_count перед вызовом
+                media_count_ref[0] = num_media
                 session.on_chunk = _on_chunk
                 session.on_chunk_args = {
-                    "total_gen": total_gen,
                     "start_time": start_time,
                 }
-                session.call_count = call_count
 
                 metrics = session.run(
                     messages=messages,
@@ -183,23 +148,12 @@ def _worker(
 
             call_count += 1
             wall_total = time.time() - start_time
+            media_name = Path(selected_audio[0]).stem
 
             if metrics is None:
-                q.put({
-                    "type": "stats",
-                    "id": worker_id,
-                    "calls": call_count,
-                    "media": Path(selected_audio[0]).stem,
-                    "media_count": num_media,
-                    "g": total_gen,
-                    "cg": 0,
-                    "speed": 0,
-                    "avg_speed": 0,
-                    "inst_speed": 0,
-                    "ttft": 0,
-                    "tail": assistant_content[:80] if assistant_content else "error",
-                    "wall": format_time(wall_total),
-                })
+                send_error_stats(q, worker_id, call_count, total_gen, wall_total,
+                                 media_name, num_media,
+                                 assistant_content[:80] if assistant_content else "error")
                 audio_index += num_media
                 prompt_index += 1
                 continue
@@ -208,21 +162,8 @@ def _worker(
             chunk_count = metrics.chunk_count
 
             if completion_tokens == 0:
-                q.put({
-                    "type": "stats",
-                    "id": worker_id,
-                    "calls": call_count,
-                    "media": Path(selected_audio[0]).stem,
-                    "media_count": num_media,
-                    "g": total_gen,
-                    "cg": 0,
-                    "speed": 0,
-                    "avg_speed": 0,
-                    "inst_speed": 0,
-                    "ttft": 0,
-                    "tail": "empty",
-                    "wall": format_time(wall_total),
-                })
+                send_error_stats(q, worker_id, call_count, total_gen, wall_total,
+                                 media_name, num_media, "empty")
                 audio_index += num_media
                 prompt_index += 1
                 continue
@@ -237,26 +178,13 @@ def _worker(
             total_gen += completion_tokens
             total_chunks += chunk_count
 
-            avg_speed = total_gen / wall_total if wall_total > 0 else 0
+            total_gen_ref[0] = total_gen
+            total_chunks_ref[0] = total_chunks
+            total_ttft_ref[0] = total_ttft
 
-            q.put({
-                "type": "stats",
-                "id": worker_id,
-                "calls": call_count,
-                "media": Path(selected_audio[0]).stem,
-                "media_count": num_media,
-                "g": total_gen,
-                "cg": completion_tokens,
-                "chunks": total_chunks,
-                "est_gen": total_gen,
-                "speed": round(metrics.call_speed, 1),
-                "avg_speed": round(avg_speed, 1),
-                "inst_speed": round(metrics.instant_speed, 1),
-                "ttft": round(turn_ttft, 2),
-                "ttft_sum": round(total_ttft, 2),
-                "tail": assistant_content[-80:] if assistant_content else "",
-                "wall": format_time(wall_total),
-            })
+            send_stats(q, worker_id, call_count, metrics, total_gen, total_chunks,
+                       total_ttft, wall_total, media_name, num_media,
+                       assistant_content[-80:] if assistant_content else "")
 
             audio_index += num_media
             prompt_index += 1
@@ -273,8 +201,8 @@ def _worker(
 # Live Table
 # ---------------------------------------------------------------------------
 
-class AudioLiveTable:
-    """Rich Live таблица для аудио-бенчмарка."""
+class AudioLiveTable(BaseLiveTable):
+    """Rich Live table for audio benchmark."""
 
     def __init__(
         self,
@@ -282,18 +210,7 @@ class AudioLiveTable:
         total_workers: int,
         response_width: int = 60,
     ) -> None:
-        self.duration = duration
-        self.total_workers = total_workers
-        self.response_width = response_width
-        self.workers: Dict[int, Dict[str, Any]] = {}
-        self._errors: Dict[int, str] = {}
-        self.console = Console()
-
-    @staticmethod
-    def _merge(w: Dict[str, Any], data: Dict[str, Any]) -> None:
-        for k, v in data.items():
-            if v is not None:
-                w[k] = v
+        super().__init__(duration, total_workers, response_width)
 
     def mark_started(self, worker_id: int, audio_count: int = 0) -> None:
         self.workers[worker_id] = {
@@ -314,164 +231,27 @@ class AudioLiveTable:
         }
 
     def update_stats(self, msg: Dict[str, Any]) -> None:
-        w = self.workers.setdefault(msg["id"], {})
+        super().update_stats(msg)
+        w = self.workers[msg["id"]]
         self._merge(w, {
-            "calls": msg.get("calls"),
             "media": msg.get("media"),
             "media_count": msg.get("media_count"),
-            "gen": msg.get("g"),
-            "gen_est": msg.get("est_gen"),
-            "chunks": msg.get("chunks"),
-            "call_gen": msg.get("cg"),
-            "speed": msg.get("inst_speed"),
-            "avg": msg.get("avg_speed"),
-            "ttft": msg.get("ttft"),
-            "ttft_sum": msg.get("ttft_sum"),
-            "wall": msg.get("wall"),
-            "tail": msg.get("tail"),
         })
 
     def update_live(self, msg: Dict[str, Any]) -> None:
-        w = self.workers.setdefault(msg["id"], {})
+        super().update_live(msg)
+        w = self.workers[msg["id"]]
         self._merge(w, {
-            "speed": msg.get("inst"),
-            "avg": msg.get("avg"),
-            "ttft": msg.get("ttft"),
-            "ttft_sum": msg.get("ttft_sum"),
-            "gen_est": msg.get("est_tok"),
-            "chunks": msg.get("chunks"),
-            "wall": msg.get("wall"),
-            "tail": msg.get("tail"),
             "media": msg.get("media", ""),
-            "media_count": msg.get("media_count", 0),
         })
-
-    def update_time(self, msg: Dict[str, Any]) -> None:
-        w = self.workers.setdefault(msg["id"], {})
-        self._merge(w, {
-            "wall": msg.get("wall"),
-            "avg": msg.get("avg"),
-        })
-
-    def mark_error(self, worker_id: int, traceback_str: str) -> None:
-        self._errors[worker_id] = traceback_str
-
-    def mark_stopped(self, worker_id: int, error_msg: str) -> None:
-        w = self.workers.setdefault(worker_id, {})
-        w["stopped"] = True
-        w["error"] = error_msg
-
-    @staticmethod
-    def _clean_tail(tail: str, max_len: int = 60) -> str:
-        if not tail:
-            return tail
-        clean = ""
-        for ch in tail:
-            cp = ord(ch)
-            if cp > 0x2E80 and (
-                (0x2E80 <= cp <= 0xA4CF)
-                or (0xAC00 <= cp <= 0xD7A3)
-                or (0xF900 <= cp <= 0xFAFF)
-                or (0xFE10 <= cp <= 0xFE19)
-                or (0xFE30 <= cp <= 0xFE6F)
-                or (0xFF00 <= cp <= 0xFF60)
-                or (0xFFE0 <= cp <= 0xFFE6)
-                or (0x20000 <= cp <= 0x2FFFD)
-            ):
-                clean += "."
-            elif 0x2300 <= cp <= 0x23FF:
-                clean += "."
-            elif ch in "\n\r\t":
-                clean += " "
-            else:
-                clean += ch
-        clean = " ".join(clean.split())
-        vlen = sum(2 if ord(ch) > 0x2E80 else 1 for ch in clean)
-        if vlen > max_len:
-            truncated = clean[:max(1, max_len - 3)]
-            vlen_trunc = sum(2 if ord(ch) > 0x2E80 else 1 for ch in truncated)
-            while vlen_trunc > max_len - 3 and truncated:
-                truncated = truncated[:-1]
-                vlen_trunc = sum(2 if ord(ch) > 0x2E80 else 1 for ch in truncated)
-            return "..." + truncated
-        return clean
+        if "media_count" in msg:
+            w["media_count"] = msg["media_count"]
 
     def render(self) -> Table:
-        from rich.table import box
-
-        table = Table(box=box.DOUBLE, show_header=True)
-
-        table.add_column("W#", style="cyan", width=4, justify="right")
-        table.add_column("Calls", style="magenta", width=6, justify="right")
-        table.add_column("Audios", style="bold yellow", width=6, justify="right")
-        table.add_column("Audio", style="green", width=14)
-        table.add_column("Gen", style="yellow", width=8, justify="right")
-        table.add_column("Call", style="white", width=7, justify="right")
-        table.add_column("Speed", style="bold green", width=9, justify="right")
-        table.add_column("Avg", style="bold blue", width=8, justify="right")
-        table.add_column("TTFT", style="red", width=8, justify="right")
-        table.add_column("TTFT sum", style="red", width=10, justify="right")
-        table.add_column("Wall", style="dim", width=7, justify="right")
-        table.add_column("Response", style="dim white", width=self.response_width)
+        table = self._make_media_table("Audios", "Audio")
 
         for wid in sorted(self.workers.keys()):
-            w = self.workers[wid]
-            err = self._errors.get(wid)
-
-            if err:
-                table.add_row(
-                    str(wid),
-                    str(w.get("calls", 0)),
-                    "",
-                    "",
-                    "ERROR",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "[red]SEE LOG[/]",
-                )
-                continue
-
-            if w.get("stopped"):
-                error_text = self._clean_tail(w.get("error", "unknown"), self.response_width)
-                table.add_row(
-                    str(wid),
-                    str(w.get("calls", 0)),
-                    "",
-                    "",
-                    "STOPPED",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    f"[red]{error_text}[/]",
-                )
-                continue
-
-            gen_val = w.get("gen_est", w.get("gen", 0))
-            tail = self._clean_tail(w.get("tail", ""), self.response_width)
-            media_name = w.get("media", "")
-            media_count = w.get("media_count", 0)
-
-            table.add_row(
-                str(wid),
-                str(w.get("calls", 0)),
-                str(media_count),
-                media_name,
-                f"{gen_val:,}",
-                f"{w.get('call_gen', 0):,}",
-                f"{w.get('speed', 0):.1f} t/s",
-                f"{w.get('avg', 0):.1f} t/s",
-                f"{w.get('ttft', 0):.2f}s",
-                f"{w.get('ttft_sum', 0):.1f}s",
-                w.get("wall", ""),
-                tail,
-            )
+            self._render_worker_row(table, wid, self.workers[wid], media=True)
 
         return table
 
@@ -535,8 +315,8 @@ def run_benchmark(
     print()
 
     # --- Запуск воркеров ---
-    q: Queue = Queue()
-    start_event: Event = Event()
+    q: Queue = Queue()  # type: ignore[valid-type]
+    start_event: Event = Event()  # type: ignore[valid-type]
     processes: List[Process] = []
 
     for i in range(workers):

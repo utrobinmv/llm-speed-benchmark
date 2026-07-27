@@ -3,6 +3,7 @@
 tests/test_streaming.py
 
 Тесты для streaming.py -- StreamMetrics, StreamSession.
+Упрощённая модель: 1 чанк ≈ 1 токен.
 """
 
 from unittest.mock import MagicMock, patch
@@ -88,7 +89,7 @@ class TestStreamSession:
 
     def test_run_returns_metrics(self):
         client = self._make_client(make_mock_chunks(prompt_tokens=100, completion_tokens=5))
-        session = StreamSession(client, call_count=0)
+        session = StreamSession(client)
         metrics = session.run(
             messages=[{"role": "user", "content": "test"}],
             model="test-model",
@@ -99,45 +100,6 @@ class TestStreamSession:
         assert metrics.ttft is not None
         assert metrics.assistant_content == "Test answer text here done. "
         assert metrics.call_speed > 0
-
-    def test_run_calibrates_first_call(self):
-        """После первого вызова tokens_per_chunk калибруется."""
-        # 5 чанков, 10 completion_tokens -> ratio = 2.0
-        client = self._make_client(make_mock_chunks(prompt_tokens=10, completion_tokens=10))
-        session = StreamSession(client, tokens_per_chunk=1.0, call_count=0)
-        session.run(
-            messages=[{"role": "user", "content": "test"}],
-            model="test-model",
-        )
-        assert session.tokens_per_chunk == 2.0  # 10 / 5
-
-    def test_run_calibrates_smoothing(self):
-        """После второго вызова -- экспоненциальное сглаживание."""
-        client = MagicMock()
-        calls = [0]
-        def create_response(**kw):
-            calls[0] += 1
-            if calls[0] == 1:
-                return iter(make_mock_chunks(prompt_tokens=10, completion_tokens=10))
-            else:
-                # 5 чанков, 5 токенов -> ratio = 1.0
-                return iter(make_mock_chunks(prompt_tokens=10, completion_tokens=5))
-        client.chat.completions.create.side_effect = create_response
-
-        session = StreamSession(client, tokens_per_chunk=1.0, call_count=0)
-        session.run(
-            messages=[{"role": "user", "content": "test"}],
-            model="test-model",
-        )
-        assert session.tokens_per_chunk == 2.0  # первый вызов
-
-        session.call_count = 1
-        session.run(
-            messages=[{"role": "user", "content": "test2"}],
-            model="test-model",
-        )
-        # Сглаживание: 2.0 * 0.7 + 1.0 * 0.3 = 1.7
-        assert abs(session.tokens_per_chunk - 1.7) < 0.01
 
     def test_run_no_usage_fallback(self):
         """Если usage не пришло -- completion_tokens = chunk_count."""
@@ -154,7 +116,7 @@ class TestStreamSession:
         # Нет финального чанка с usage
 
         client = self._make_client(chunks)
-        session = StreamSession(client, call_count=0)
+        session = StreamSession(client)
         metrics = session.run(
             messages=[{"role": "user", "content": "test"}],
             model="test-model",
@@ -193,7 +155,7 @@ class TestStreamSession:
         chunks.append(final)
 
         client = self._make_client(chunks)
-        session = StreamSession(client, call_count=0)
+        session = StreamSession(client)
         metrics = session.run(
             messages=[{"role": "user", "content": "test"}],
             model="test-model",
@@ -231,7 +193,7 @@ class TestStreamSession:
         chunks.append(final)
 
         client = self._make_client(chunks)
-        session = StreamSession(client, call_count=0)
+        session = StreamSession(client)
         metrics = session.run(
             messages=[{"role": "user", "content": "test"}],
             model="test-model",
@@ -243,7 +205,7 @@ class TestStreamSession:
     def test_run_empty_response(self):
         """Пустой ответ -- все нули."""
         client = self._make_client([])
-        session = StreamSession(client, call_count=0)
+        session = StreamSession(client)
         metrics = session.run(
             messages=[{"role": "user", "content": "test"}],
             model="test-model",
@@ -257,11 +219,10 @@ class TestStreamSession:
         """on_chunk callback вызывается во время стриминга."""
         callback_data = []
 
-        def on_chunk(chunk_count, inst_sp, avg_sp, ttft, tail, wall):
+        def on_chunk(chunk_count, inst_sp, ttft, tail, wall):
             callback_data.append({
                 "chunk_count": chunk_count,
                 "inst_sp": inst_sp,
-                "avg_sp": avg_sp,
                 "ttft": ttft,
                 "tail": tail,
                 "wall": wall,
@@ -290,9 +251,8 @@ class TestStreamSession:
         client = self._make_client(chunks)
         session = StreamSession(
             client,
-            call_count=0,
             on_chunk=on_chunk,
-            on_chunk_args={"total_gen": 0, "start_time": time.time()},
+            on_chunk_args={"start_time": time.time()},
         )
         metrics = session.run(
             messages=[{"role": "user", "content": "test"}],
@@ -306,7 +266,7 @@ class TestStreamSession:
     def test_run_no_callback(self):
         """Без callback -- работает нормально."""
         client = self._make_client(make_mock_chunks(prompt_tokens=10, completion_tokens=5))
-        session = StreamSession(client, call_count=0, on_chunk=None)
+        session = StreamSession(client, on_chunk=None)
         metrics = session.run(
             messages=[{"role": "user", "content": "test"}],
             model="test-model",
@@ -316,7 +276,7 @@ class TestStreamSession:
     def test_run_elapsed_positive(self):
         """elapsed > 0 после завершения."""
         client = self._make_client(make_mock_chunks(prompt_tokens=10, completion_tokens=5))
-        session = StreamSession(client, call_count=0)
+        session = StreamSession(client)
         metrics = session.run(
             messages=[{"role": "user", "content": "test"}],
             model="test-model",
@@ -326,7 +286,7 @@ class TestStreamSession:
     def test_run_ttft_positive(self):
         """TTFT > 0 когда есть токены."""
         client = self._make_client(make_mock_chunks(prompt_tokens=10, completion_tokens=5))
-        session = StreamSession(client, call_count=0)
+        session = StreamSession(client)
         metrics = session.run(
             messages=[{"role": "user", "content": "test"}],
             model="test-model",
@@ -340,57 +300,27 @@ class TestStreamSession:
 # ============================================================================
 
 class TestInstantSpeed:
-    """StreamSession: _instant_speed -- мгновенная скорость."""
+    """StreamSession: _instant_speed -- мгновенная скорость (1 чанк = 1 токен)."""
 
     def test_empty_buffer(self):
-        session = StreamSession(MagicMock(), call_count=0)
+        session = StreamSession(MagicMock())
         assert session._instant_speed([]) == 0.0
 
     def test_single_entry(self):
-        session = StreamSession(MagicMock(), call_count=0)
+        session = StreamSession(MagicMock())
         assert session._instant_speed([(1.0, 1)]) == 0.0
 
     def test_two_entries(self):
-        session = StreamSession(MagicMock(), tokens_per_chunk=1.0, call_count=0)
+        session = StreamSession(MagicMock())
         buf = [(0.0, 0), (1.0, 10)]  # 10 чанков за 1 сек
         speed = session._instant_speed(buf)
-        assert speed == 10.0
-
-    def test_with_tokens_per_chunk(self):
-        session = StreamSession(MagicMock(), tokens_per_chunk=2.0, call_count=0)
-        buf = [(0.0, 0), (1.0, 10)]  # 10 чанков * 2 = 20 токенов
-        speed = session._instant_speed(buf)
-        assert speed == 20.0
+        assert speed == 10.0  # 10 чанков / 1 сек
 
     def test_small_window(self):
         """Меньше 5 записей -- использует все."""
-        session = StreamSession(MagicMock(), tokens_per_chunk=1.0, call_count=0)
+        session = StreamSession(MagicMock())
         buf = [(i * 0.1, i * 5) for i in range(3)]  # 3 записи
         speed = session._instant_speed(buf)
         # win = min(5, 2) = 2
-        # dt = 0.2, dc = (10 - 0) * 1.0 = 10
+        # dt = 0.2, dc = 10 - 0 = 10 (1 чанк = 1 токен)
         assert speed == 50.0  # 10 / 0.2
-
-
-# ============================================================================
-# StreamSession -- _calibrate()
-# ============================================================================
-
-class TestCalibrate:
-    """StreamSession: _calibrate -- калибровка tokens_per_chunk."""
-
-    def test_first_call_exact(self):
-        session = StreamSession(MagicMock(), tokens_per_chunk=1.0, call_count=0)
-        session._calibrate(10, 20)  # 10 чанков, 20 токенов
-        assert session.tokens_per_chunk == 2.0
-
-    def test_subsequent_smoothing(self):
-        session = StreamSession(MagicMock(), tokens_per_chunk=2.0, call_count=5)
-        session._calibrate(10, 10)  # ratio = 1.0
-        # 2.0 * 0.7 + 1.0 * 0.3 = 1.7
-        assert abs(session.tokens_per_chunk - 1.7) < 0.01
-
-    def test_zero_chunks_no_change(self):
-        session = StreamSession(MagicMock(), tokens_per_chunk=1.5, call_count=0)
-        session._calibrate(0, 0)
-        assert session.tokens_per_chunk == 1.5  # не изменился

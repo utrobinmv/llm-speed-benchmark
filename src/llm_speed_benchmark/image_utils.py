@@ -16,7 +16,7 @@ import random
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFilter
 

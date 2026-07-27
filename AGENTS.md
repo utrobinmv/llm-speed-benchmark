@@ -33,6 +33,8 @@ llm-speed-benchmark/
 │   ├── bench_multi.py               # Многопроцессный + LiveTable + cli()
 │   ├── bench_vision.py              # Vision-бенчмарк + cli()
 │   ├── bench_audio.py               # Audio-бенчмарк + cli()
+│   ├── live_table.py                # BaseLiveTable — общий класс Live-таблицы
+│   ├── worker_common.py             # Общие воркер-хелперы (time_sender, on_chunk, stats)
 │   ├── image_utils.py               # Генерация/загрузка изображений
 │   ├── audio_utils.py               # Загрузка аудио из бандла (assets/audio/)
 │   ├── streaming.py                 # StreamSession + StreamMetrics
