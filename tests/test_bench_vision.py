@@ -6,8 +6,7 @@ tests/test_bench_vision.py
 """
 
 import base64
-from unittest.mock import MagicMock, patch
-
+from unittest.mock import MagicMock, patch, ANY
 
 
 class TestImageUtils:
@@ -26,7 +25,6 @@ class TestImageUtils:
     def test_generate_test_images_variety(self, tmp_path):
         from llm_speed_benchmark.image_utils import generate_test_images
 
-        # 8 вариантов * 3 = 24 изображения
         images = generate_test_images(str(tmp_path), count=24)
         assert len(images) == 24
 
@@ -45,7 +43,6 @@ class TestImageUtils:
         images = generate_test_images(str(tmp_path), count=1)
         b64 = load_image_as_base64(images[0])
         assert isinstance(b64, str)
-        # Проверяем что декодируется
         decoded = base64.b64decode(b64)
         assert decoded.startswith(b"\x89PNG")  # PNG magic
 
@@ -82,6 +79,31 @@ class TestImageUtils:
         assert content[0]["type"] == "text"
         for i in range(1, 4):
             assert content[i]["type"] == "image_url"
+
+    def test_build_mixed_vision_message(self, tmp_path):
+        """Проверяет build_mixed_vision_message с изображениями и видео."""
+        from llm_speed_benchmark.image_utils import (
+            build_mixed_vision_message,
+            generate_test_images,
+        )
+
+        images = generate_test_images(str(tmp_path), count=2)
+        # Создаём фейковое видео
+        fake_video = tmp_path / "test.mp4"
+        fake_video.write_bytes(images[0].read_bytes())
+
+        messages = build_mixed_vision_message(
+            [images[0], images[1]], [fake_video], "Опиши медиа"
+        )
+
+        assert len(messages) == 1
+        content = messages[0]["content"]
+        assert len(content) == 4  # 1 text + 2 images + 1 video
+        assert content[0]["type"] == "text"
+        assert content[0]["text"] == "Опиши медиа"
+        assert content[1]["type"] == "image_url"
+        assert content[2]["type"] == "image_url"
+        assert content[3]["type"] == "video_url"
 
     def test_sawtooth_pattern(self):
         from llm_speed_benchmark.image_utils import sawtooth_image_count
@@ -126,6 +148,30 @@ class TestImageUtils:
 class TestVisionWorker:
     """Тесты для _worker с моками."""
 
+    def _make_worker_thread(self, worker_id, q, start_event, image_paths, video_paths,
+                            duration, prompts, max_images, max_videos, skip_errors):
+        """Helper: запускает воркера в потоке."""
+        from threading import Thread
+
+        from llm_speed_benchmark.bench_vision import _worker
+
+        p = Thread(
+            target=_worker,
+            args=(worker_id, q, start_event, image_paths, video_paths,
+                  duration, prompts, max_images, max_videos, skip_errors),
+            daemon=True,
+        )
+        return p
+
+    def _collect_messages(self, q):
+        messages = []
+        while not q.empty():
+            try:
+                messages.append(q.get_nowait())
+            except Exception:
+                break
+        return messages
+
     @patch("llm_speed_benchmark.bench_vision.OpenAI")
     @patch("llm_speed_benchmark.bench_vision.StreamSession")
     def test_worker_sends_start_message(
@@ -133,7 +179,6 @@ class TestVisionWorker:
     ):
         from multiprocessing import Event, Queue
 
-        from llm_speed_benchmark.bench_vision import _worker
         from llm_speed_benchmark.image_utils import generate_test_images
 
         q = Queue()
@@ -143,7 +188,6 @@ class TestVisionWorker:
         images = generate_test_images(str(tmp_path), count=2)
         image_paths = [str(p) for p in images]
 
-        # Мок StreamSession
         mock_session = MagicMock()
         mock_metrics = MagicMock()
         mock_metrics.completion_tokens = 100
@@ -151,37 +195,25 @@ class TestVisionWorker:
         mock_metrics.chunk_count = 50
         mock_metrics.elapsed = 1.0
         mock_metrics.ttft = 0.5
-        mock_metrics.assistant_content = "Это тестовое изображение с геометрическими фигурами."
+        mock_metrics.assistant_content = "Тестовое описание"
         mock_metrics.call_speed = 100.0
         mock_metrics.instant_speed = 100.0
         mock_session.run.return_value = mock_metrics
-        mock_session.tokens_per_chunk = 2.0
         mock_session_cls.return_value = mock_session
 
-        # Мок OpenAI client
         mock_client = MagicMock()
         mock_openai_cls.return_value = mock_client
 
-        p = __import__("threading", fromlist=["Thread"]).Thread(
-            target=_worker,
-            args=(0, q, start_event, image_paths, 2, ["Опиши"], 1, False, False, 1),
-            daemon=True,
+        p = self._make_worker_thread(
+            0, q, start_event, image_paths, [], 2, ["Опиши"], 1, 0, False
         )
         p.start()
         p.join(timeout=10)
 
-        # Проверяем что воркер отправил start
-        messages = []
-        while not q.empty():
-            try:
-                messages.append(q.get_nowait())
-            except Exception:
-                break
-
+        messages = self._collect_messages(q)
         start_msgs = [m for m in messages if m.get("type") == "start"]
         assert len(start_msgs) == 1
         assert start_msgs[0]["id"] == 0
-        assert start_msgs[0]["media"] == 4  # generate_test_images(min=4)
 
     @patch("llm_speed_benchmark.bench_vision.OpenAI")
     @patch("llm_speed_benchmark.bench_vision.StreamSession")
@@ -190,7 +222,6 @@ class TestVisionWorker:
     ):
         from multiprocessing import Event, Queue
 
-        from llm_speed_benchmark.bench_vision import _worker
         from llm_speed_benchmark.image_utils import generate_test_images
 
         q = Queue()
@@ -207,31 +238,22 @@ class TestVisionWorker:
         mock_metrics.chunk_count = 40
         mock_metrics.elapsed = 0.8
         mock_metrics.ttft = 0.3
-        mock_metrics.assistant_content = "На изображении градиент от красного к синему."
+        mock_metrics.assistant_content = "Градиент"
         mock_metrics.call_speed = 100.0
         mock_metrics.instant_speed = 100.0
         mock_session.run.return_value = mock_metrics
-        mock_session.tokens_per_chunk = 2.0
         mock_session_cls.return_value = mock_session
 
         mock_client = MagicMock()
         mock_openai_cls.return_value = mock_client
 
-        p = __import__("threading", fromlist=["Thread"]).Thread(
-            target=_worker,
-            args=(1, q, start_event, image_paths, 2, ["Опиши"], 1, False, False, 1),
-            daemon=True,
+        p = self._make_worker_thread(
+            1, q, start_event, image_paths, [], 2, ["Опиши"], 1, 0, False
         )
         p.start()
         p.join(timeout=10)
 
-        messages = []
-        while not q.empty():
-            try:
-                messages.append(q.get_nowait())
-            except Exception:
-                break
-
+        messages = self._collect_messages(q)
         stats_msgs = [m for m in messages if m.get("type") == "stats"]
         assert len(stats_msgs) >= 1
         assert stats_msgs[0]["id"] == 1
@@ -247,7 +269,6 @@ class TestVideoUtils:
             generate_test_images,
         )
 
-        # Создаём "видео" файл (фактически PNG с расширением .mp4 для теста)
         images = generate_test_images(str(tmp_path), count=1)
         fake_video = tmp_path / "test.mp4"
         fake_video.write_bytes(images[0].read_bytes())
@@ -269,7 +290,6 @@ class TestVideoUtils:
             generate_test_images,
         )
 
-        # Создаём 3 фейковых видео
         images = generate_test_images(str(tmp_path), count=4)
         videos = []
         for i in range(3):
@@ -310,7 +330,6 @@ class TestVideoUtils:
             generate_test_images,
         )
 
-        # Создаём фейковые видео из изображений (в отдельной папке)
         src_dir = tmp_path / "src"
         images = generate_test_images(str(src_dir), count=4)
         for i in range(3):
@@ -345,7 +364,6 @@ class TestVideoUtils:
     def test_ffmpeg_available(self):
         from llm_speed_benchmark.image_utils import _ffmpeg_available
 
-        # Просто проверяем что функция не падает
         result = _ffmpeg_available()
         assert isinstance(result, bool)
 
@@ -374,8 +392,8 @@ class TestVisionLiveTable:
         from llm_speed_benchmark.bench_vision import VisionLiveTable
 
         table = VisionLiveTable(None, 2, response_width=40)
-        table.mark_started(0, 10)
-        table.mark_started(1, 10)
+        table.mark_started(0)
+        table.mark_started(1)
 
         table.update_stats({
             "id": 0,
@@ -396,12 +414,13 @@ class TestVisionLiveTable:
         rendered = table.render()
         assert rendered is not None
 
-    def test_render_video_mode(self):
+    def test_render_video_only_mode(self):
         from llm_speed_benchmark.bench_vision import VisionLiveTable
 
-        table = VisionLiveTable(None, 2, response_width=40, video_mode=True)
-        table.mark_started(0, 5)
-        table.mark_started(1, 5)
+        table = VisionLiveTable(None, 2, response_width=40,
+                                max_images=0, max_videos=3)
+        table.mark_started(0)
+        table.mark_started(1)
 
         table.update_stats({
             "id": 0,
@@ -422,11 +441,42 @@ class TestVisionLiveTable:
         rendered = table.render()
         assert rendered is not None
 
+    def test_render_mixed_mode(self):
+        """Проверяет mixed режим с двумя медиа-колонками."""
+        from llm_speed_benchmark.bench_vision import VisionLiveTable
+
+        table = VisionLiveTable(None, 2, response_width=40,
+                                max_images=2, max_videos=2)
+        table.mark_started(0)
+        table.mark_started(1)
+
+        table.update_stats({
+            "id": 0,
+            "calls": 3,
+            "media": "test_image_000",
+            "media_count": 2,
+            "media_img": "test_image_000",
+            "media_img_count": 1,
+            "media_vid": "test_video_000",
+            "media_vid_count": 1,
+            "g": 300,
+            "cg": 100,
+            "speed": 40.0,
+            "avg_speed": 35.0,
+            "inst_speed": 45.0,
+            "ttft": 1.2,
+            "ttft_sum": 3.6,
+            "tail": "Mixed media description",
+            "wall": "00:15",
+        })
+
+        rendered = table.render()
+        assert rendered is not None
+
     def test_clean_tail_wide_chars(self):
         from llm_speed_benchmark.bench_vision import VisionLiveTable
 
         table = VisionLiveTable(duration=None, total_workers=1, response_width=20)
-        # Wide CJK characters should be replaced
         result = table._clean_tail("Hello 世界 Test")
         assert "世" not in result
         assert "界" not in result
@@ -437,7 +487,7 @@ class TestVisionLiveTable:
         table = VisionLiveTable(duration=None, total_workers=1, response_width=20)
         long_text = "A" * 100
         result = table._clean_tail(long_text)
-        assert len(result) <= 25  # ... + max_vlen + небольшой запас
+        assert len(result) <= 25
 
     def test_clean_tail_empty(self):
         from llm_speed_benchmark.bench_vision import VisionLiveTable
@@ -447,25 +497,21 @@ class TestVisionLiveTable:
 
 
 class TestSawtoothRegression:
-    """Регрессионные тесты для sawtooth_image_count — баги которые реально ломали."""
+    """Регрессионные тесты для sawtooth_image_count."""
 
     def test_zero_max_images_no_division_by_zero(self):
-        """REGRESSION: max_images=0 вызывал ZeroDivisionError (elif вместо if)."""
         from llm_speed_benchmark.image_utils import sawtooth_image_count
 
-        # Должен вернуть 1, а не упасть
         result = sawtooth_image_count(0, 0)
         assert result == 1
 
     def test_negative_max_images_no_crash(self):
-        """max_images < 0 не должен крашиться."""
         from llm_speed_benchmark.image_utils import sawtooth_image_count
 
         result = sawtooth_image_count(5, -10)
         assert result == 1
 
     def test_max_images_2_pattern(self):
-        """minимальный не-тривиальный паттерн: 2, 1, 2, 1..."""
         from llm_speed_benchmark.image_utils import sawtooth_image_count
 
         expected = [2, 1, 2, 1, 2, 1]
@@ -477,11 +523,10 @@ class TestVisionStatsRegression:
     """Регрессионные тесты для VisionLiveTable — баги в маппинге ключей."""
 
     def test_update_stats_maps_g_to_gen(self):
-        """REGRESSION: 'g' в update_stats не маппился на 'gen' -> итоги всегда 0."""
         from llm_speed_benchmark.bench_vision import VisionLiveTable
 
         table = VisionLiveTable(None, 1)
-        table.mark_started(0, 10)
+        table.mark_started(0)
         table.update_stats({
             "id": 0,
             "calls": 3,
@@ -498,15 +543,13 @@ class TestVisionStatsRegression:
         assert w["calls"] == 3
 
     def test_update_stats_partial_does_not_lose_gen(self):
-        """Частичное обновление не должно обнулить gen."""
         from llm_speed_benchmark.bench_vision import VisionLiveTable
 
         table = VisionLiveTable(None, 1)
-        table.mark_started(0, 10)
+        table.mark_started(0)
         table.update_stats({"id": 0, "g": 1000, "calls": 1, "wall": "00:05", "tail": "ok"})
-        # Второе обновление без 'g'
         table.update_stats({"id": 0, "calls": 2, "ttft": 0.3})
-        assert table.workers[0]["gen"] == 1000  # не обнулён
+        assert table.workers[0]["gen"] == 1000
         assert table.workers[0]["calls"] == 2
 
 
@@ -518,7 +561,6 @@ class TestVisionWorkerSkipErrors:
     def test_worker_continues_after_error_with_skip_errors(
         self, mock_session_cls, mock_openai_cls, tmp_path
     ):
-        """С skip_errors=True воркер продолжает после ошибки."""
         from multiprocessing import Event, Queue
 
         from llm_speed_benchmark.bench_vision import _worker
@@ -549,7 +591,6 @@ class TestVisionWorkerSkipErrors:
             return metrics
 
         mock_session.run.side_effect = run_side_effect
-        mock_session.tokens_per_chunk = 2.0
         mock_session_cls.return_value = mock_session
 
         mock_client = MagicMock()
@@ -557,7 +598,7 @@ class TestVisionWorkerSkipErrors:
 
         p = __import__("threading", fromlist=["Thread"]).Thread(
             target=_worker,
-            args=(0, q, start_event, image_paths, 3, ["Опиши"], 1, True, False, 1),
+            args=(0, q, start_event, image_paths, [], 3, ["Опиши"], 1, 0, True),
             daemon=True,
         )
         p.start()
@@ -571,11 +612,9 @@ class TestVisionWorkerSkipErrors:
                 break
 
         error_stops = [m for m in messages if m.get("type") == "error_stop"]
-        # С skip_errors=True НЕ должно быть error_stop
         assert len(error_stops) == 0
 
         stats_msgs = [m for m in messages if m.get("type") == "stats"]
-        # Должно быть >= 2 (ошибка + успешный вызов)
         assert len(stats_msgs) >= 2
 
 
@@ -587,7 +626,6 @@ class TestVisionWorkerVideoMode:
     def test_worker_video_mode_sends_video_message(
         self, mock_session_cls, mock_openai_cls, tmp_path
     ):
-        """В video_mode воркер вызывает build_video_message."""
         from multiprocessing import Event, Queue
 
         from llm_speed_benchmark.bench_vision import _worker
@@ -597,7 +635,6 @@ class TestVisionWorkerVideoMode:
         start_event = Event()
         start_event.set()
 
-        # Создаём фейковое видео
         images = generate_test_images(str(tmp_path), count=1)
         fake_video = tmp_path / "test.mp4"
         fake_video.write_bytes(images[0].read_bytes())
@@ -613,7 +650,6 @@ class TestVisionWorkerVideoMode:
         mock_metrics.call_speed = 100.0
         mock_metrics.instant_speed = 100.0
         mock_session.run.return_value = mock_metrics
-        mock_session.tokens_per_chunk = 2.0
         mock_session_cls.return_value = mock_session
 
         mock_client = MagicMock()
@@ -621,7 +657,7 @@ class TestVisionWorkerVideoMode:
 
         p = __import__("threading", fromlist=["Thread"]).Thread(
             target=_worker,
-            args=(0, q, start_event, video_paths, 2, ["Опиши"], 1, False, True, 1),
+            args=(0, q, start_event, [], video_paths, 2, ["Опиши"], 0, 1, False),
             daemon=True,
         )
         p.start()
@@ -651,8 +687,10 @@ class TestVisionCli:
                 assert call_kwargs["workers"] == 4
                 assert call_kwargs["max_images"] == 1
                 assert call_kwargs["max_videos"] == 0
+                # New: no video_mode kwarg
+                assert "video_mode" not in call_kwargs
 
-    def test_cli_video_mode_args(self):
+    def test_cli_video_only_args(self):
         from llm_speed_benchmark.bench_vision import cli
 
         with patch("sys.argv", ["bench_vision", "--max-videos", "3", "-w", "2"]):
@@ -661,7 +699,18 @@ class TestVisionCli:
                 call_kwargs = mock_run.call_args[1]
                 assert call_kwargs["max_videos"] == 3
                 assert call_kwargs["workers"] == 2
-                assert call_kwargs["video_mode"] is True
+                assert call_kwargs["max_images"] == 1  # default
+                assert "video_mode" not in call_kwargs
+
+    def test_cli_mixed_mode_args(self):
+        from llm_speed_benchmark.bench_vision import cli
+
+        with patch("sys.argv", ["bench_vision", "--max-videos", "2", "--max-images", "3"]):
+            with patch("llm_speed_benchmark.bench_vision.run_benchmark") as mock_run:
+                cli()
+                call_kwargs = mock_run.call_args[1]
+                assert call_kwargs["max_videos"] == 2
+                assert call_kwargs["max_images"] == 3
 
     def test_cli_skip_errors(self):
         from llm_speed_benchmark.bench_vision import cli
@@ -681,12 +730,12 @@ class TestVisionCli:
                 call_kwargs = mock_run.call_args[1]
                 assert call_kwargs["prompts"] == ["Prompt 1", "Prompt 2"]
 
-    def test_cli_max_images_zero_no_crash(self):
-        """REGRESSION: --max-images 0 не должен крашиться."""
+    def test_cli_both_zero_exits(self):
+        """--max-images 0 --max-videos 0 должно выйти с ошибкой."""
         from llm_speed_benchmark.bench_vision import cli
 
         with patch("sys.argv", ["bench_vision", "--max-images", "0", "--max-videos", "0"]):
             with patch("llm_speed_benchmark.bench_vision.run_benchmark") as mock_run:
-                cli()
-                call_kwargs = mock_run.call_args[1]
-                assert call_kwargs["max_images"] == 0
+                with patch("sys.exit") as mock_exit:
+                    cli()
+                    mock_exit.assert_called_once_with(1)

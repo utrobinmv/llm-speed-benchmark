@@ -320,6 +320,31 @@ class BaseLiveTable(ABC):
 
         return table
 
+    def _make_dual_media_table(self) -> Table:
+        """Create a Rich Table for mixed image+video benchmarks.
+
+        Shows both Imgs/Vid count columns and Image/Video name columns
+        when the request may contain both types of media simultaneously.
+        """
+        table = Table(box=_rich_box.DOUBLE, show_header=True)
+
+        table.add_column("W#", style="cyan", width=4, justify="right")
+        table.add_column("Calls", style="magenta", width=6, justify="right")
+        table.add_column("Imgs", style="bold yellow", width=6, justify="right")
+        table.add_column("Image", style="green", width=14)
+        table.add_column("Vid", style="bold yellow", width=5, justify="right")
+        table.add_column("Video", style="green", width=14)
+        table.add_column("Gen", style="yellow", width=8, justify="right")
+        table.add_column("Call", style="white", width=7, justify="right")
+        table.add_column("Speed", style="bold green", width=9, justify="right")
+        table.add_column("Avg", style="bold blue", width=8, justify="right")
+        table.add_column("TTFT", style="red", width=8, justify="right")
+        table.add_column("TTFT sum", style="red", width=10, justify="right")
+        table.add_column("Wall", style="dim", width=7, justify="right")
+        table.add_column("Response", style="dim white", width=self.response_width)
+
+        return table
+
     def _render_worker_row(
         self,
         table: Table,
@@ -327,6 +352,7 @@ class BaseLiveTable(ABC):
         w: dict[str, Any],
         *,
         media: bool = False,
+        dual_media: bool = False,
     ) -> None:
         """Add a single worker row to *table*.
 
@@ -337,11 +363,19 @@ class BaseLiveTable(ABC):
 
         Set *media* = True when the table has the extra media columns
         (count + name) so the row cell count matches.
+        Set *dual_media* = True for mixed image+video table (14 columns).
         """
         err = self._errors.get(wid)
 
         if err:
-            if media:
+            if dual_media:
+                table.add_row(
+                    str(wid), str(w.get("calls", 0)),
+                    "", "", "", "",
+                    "ERROR", "", "", "", "", "", "",
+                    "[red]SEE LOG[/]",
+                )
+            elif media:
                 table.add_row(
                     str(wid),
                     str(w.get("calls", 0)),
@@ -373,7 +407,14 @@ class BaseLiveTable(ABC):
 
         if w.get("stopped"):
             error_text = self._clean_tail(w.get("error", "unknown"), self.response_width)
-            if media:
+            if dual_media:
+                table.add_row(
+                    str(wid), str(w.get("calls", 0)),
+                    "", "", "", "",
+                    "STOPPED", "", "", "", "", "", "",
+                    f"[red]{error_text}[/]",
+                )
+            elif media:
                 table.add_row(
                     str(wid),
                     str(w.get("calls", 0)),
@@ -407,7 +448,28 @@ class BaseLiveTable(ABC):
         gen_val = w.get("gen_est", w.get("gen", 0))
         tail = self._clean_tail(w.get("tail", ""), self.response_width)
 
-        if media:
+        if dual_media:
+            img_name = w.get("media_img", "")
+            vid_name = w.get("media_vid", "")
+            img_count = w.get("media_img_count", 0)
+            vid_count = w.get("media_vid_count", 0)
+            table.add_row(
+                str(wid),
+                str(w.get("calls", 0)),
+                str(img_count),
+                img_name,
+                str(vid_count),
+                vid_name,
+                f"{gen_val:,}",
+                f"{w.get('call_gen', 0):,}",
+                f"{w.get('speed', 0):.1f} t/s",
+                f"{w.get('avg', 0):.1f} t/s",
+                f"{w.get('ttft', 0):.2f}s",
+                f"{w.get('ttft_sum', 0):.1f}s",
+                w.get("wall", ""),
+                tail,
+            )
+        elif media:
             media_name = w.get("media", "")
             media_count = w.get("media_count", 0)
             table.add_row(

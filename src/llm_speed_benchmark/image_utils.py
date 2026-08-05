@@ -617,6 +617,47 @@ def build_video_message(
     return [{"role": "user", "content": content_parts}]
 
 
+def build_mixed_vision_message(
+    image_paths: Sequence[str | Path],
+    video_paths: Sequence[str | Path],
+    prompt: str = "Опиши подробно что изображено и происходит на этих медиа.",
+) -> list:
+    """Создаёт message с изображениями И видео одновременно.
+
+    Собирает все медиа в один user message: сначала изображения,
+    потом видео. Удобно для бенчмарка мультимодальных моделей,
+    поддерживающих оба типа контента за раз.
+
+    Args:
+        image_paths: Пути к изображениям.
+        video_paths: Пути к видео.
+        prompt: Текстовый промпт.
+
+    Returns:
+        Список сообщений в формате OpenAI chat API.
+    """
+    content_parts: list = [{"type": "text", "text": prompt}]
+    for img_path in image_paths:
+        b64 = load_image_as_base64(img_path)
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{b64}",
+                "detail": "auto",
+            },
+        })
+    for vid_path in video_paths:
+        mime, b64 = load_video_as_base64(vid_path)
+        content_parts.append({
+            "type": "video_url",
+            "video_url": {
+                "url": f"data:{mime};base64,{b64}",
+                "detail": "auto",
+            },
+        })
+    return [{"role": "user", "content": content_parts}]
+
+
 def discover_videos(directory: str | Path) -> List[Path]:
     """Находит все видео в директории.
 
