@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-speed-benchmark"
-version = "0.2.0"
+version = "0.3.0"
 description = "Бенчмарк скорости стриминга LLM через vLLM (OpenAI-compatible API)"
 readme = "README.md"
 license = "MIT"
@@ -44,6 +44,9 @@ bench_single = "llm_speed_benchmark.bench_single:cli"
 bench_multi = "llm_speed_benchmark.bench_multi:cli"
 bench_vision = "llm_speed_benchmark.bench_vision:cli"
 bench_audio = "llm_speed_benchmark.bench_audio:cli"
+bench_transcription = "llm_speed_benchmark.bench_transcription:cli"
+bench_tts = "llm_speed_benchmark.bench_tts:cli"
+bench_emb = "llm_speed_benchmark.bench_emb:cli"
 
 [project.urls]
 Homepage = "https://github.com/utrobinmv/llm-speed-benchmark"

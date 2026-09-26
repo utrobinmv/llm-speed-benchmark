@@ -2,7 +2,7 @@
 
 Бенчмарк скорости стриминга LLM через OpenAI-compatible API (vLLM, Ollama, и любой совместимый сервер).
 
-Четыре режима: **однопоточный**, **многопроцессный** с Rich Live-таблицей, **vision** для мультимодальных моделей, и **audio** для моделей с поддержкой аудио/транскрипции.
+Шесть режимов: **однопоточный**, **многопроцессный** с Rich Live-таблицей, **vision** для мультимодальных моделей, **audio** для моделей с поддержкой аудио, **transcription** для ASR-моделей, **TTS** для синтеза речи, и **embedding** для эмбединг-моделей.
 
 ## Установка
 
@@ -185,6 +185,110 @@ bench_audio -p "Транскрибируй" -p "Распознай текст" #
 | `--response-width` | | Ширина колонки Response |
 | `--skip-errors` | | Продолжать после ошибки |
 
+### Transcription-бенчмарк (`bench_transcription`)
+
+Для ASR-моделей (Whisper, Qwen-ASR) — транскрипция речи в текст:
+
+```bash
+bench_transcription                                   # 4 воркера, бандл аудио
+bench_transcription -w 2 -d 120                       # 2 воркера, 120 сек
+bench_transcription --audio ~/workspace/data/audio/   # свои аудио
+bench_transcription --durations 5 10 30 60            # генерация аудио разной длины
+bench_transcription --max-duration 30                 # фильтр по максимальной длине
+bench_transcription --language ru                     # язык транскрипции
+bench_transcription --mode once                       # один проход (не зацикливание)
+bench_transcription --model-timeout 1200              # таймаут для долгих аудио
+```
+
+**Особенности:**
+- Endpoint: `audio.transcriptions` (не `chat.completions`)
+- Генерация аудио заданной длительности через зацикливание бандла
+- Метрики: RTF (Real-Time Factor), токены/сек, TTFT
+- Конфиг из `.env`: `TRANSCRIPTION_BASE_URL`, `TRANSCRIPTION_API_KEY`, `TRANSCRIPTION_MODEL`
+
+**Аргументы bench_transcription:**
+
+| Аргумент | Краткий | Описание |
+|---|---|---|
+| `--workers` | `-w` | Количество воркеров (по умолчанию: 4) |
+| `--duration` | `-d` | Длительность в секундах |
+| `--audio` | | Директория с аудио файлами |
+| `--durations` | | Список длительностей аудио для генерации (сек) |
+| `--max-duration` | | Максимальная длительность аудио (фильтр) |
+| `--model-timeout` | | Таймаут запроса к модели |
+| `--prompt` | `-p` | Промпт для контекста |
+| `--language` | `-l` | Язык транскрипции |
+| `--response-format` | | Формат ответа (json, text, srt, verbose_json, vtt) |
+| `--response-width` | | Ширина колонки Transcript |
+| `--skip-errors` | | Продолжать после ошибки |
+| `--mode` | | `cycling` (зацикливание) или `once` (один проход) |
+
+### TTS-бенчмарк (`bench_tts`)
+
+Для моделей синтеза речи (Qwen3-TTS и другие):
+
+```bash
+bench_tts                                           # 4 воркера, тексты разной длины
+bench_tts -w 2 -d 120                               # 2 воркера, 120 сек
+bench_tts --char-counts 10 50 200 500               # тексты указанной длины (символы)
+bench_tts --voice agata                             # голос TTS
+bench_tts --response-format wav                     # формат аудио (wav, mp3, opus, pcm)
+bench_tts --mode once                               # один проход
+bench_tts --model-timeout 600                       # таймаут запроса
+```
+
+**Особенности:**
+- Endpoint: `audio.speech` (POST /v1/audio/speech)
+- Тексты разной длины: short (10-50), medium (50-200), long (200-500), very_long (500+)
+- Метрики: TTFT, char/s (символы/сек), KB/s (размер аудио/сек), avg processing time
+- Конфиг из `.env`: `TTS_BASE_URL`, `TTS_API_KEY`, `TTS_MODEL`
+
+**Аргументы bench_tts:**
+
+| Аргумент | Краткий | Описание |
+|---|---|---|
+| `--workers` | `-w` | Количество воркеров (по умолчанию: 4) |
+| `--duration` | `-d` | Длительность в секундах |
+| `--char-counts` | | Список длин текстов в символах |
+| `--voice` | | Голос TTS (по умолчанию: agata) |
+| `--response-format` | | Формат аудио (wav, mp3, opus, pcm) |
+| `--model-timeout` | | Таймаут запроса к модели |
+| `--response-width` | | Ширина колонки Text |
+| `--skip-errors` | | Продолжать после ошибки |
+| `--mode` | | `cycling` (зацикливание) или `once` (один проход) |
+
+### Embedding-бенчмарк (`bench_emb`)
+
+Для эмбединг-моделей (embeddinggemma-300m и другие):
+
+```bash
+bench_emb                                           # 4 воркера, тексты разной длины
+bench_emb -w 8 -d 120                               # 8 воркеров, 120 сек
+bench_emb --char-counts 10 50 200 500               # тексты указанной длины (символы)
+bench_emb --batch-sizes 1 5 10                      # batch-запросы (несколько текстов в одном вызове)
+bench_emb --mode once                               # один проход
+bench_emb --model-timeout 600                       # таймаут запроса
+```
+
+**Особенности:**
+- Endpoint: `embeddings` (POST /v1/embeddings)
+- Поддержка batch-запросов: несколько текстов в одном API-вызове
+- Метрики: TTFT, char/s (символы/сек), doc/s (документы/сек), размерность эмбединга
+- Конфиг из `.env`: `EMB_BASE_URL`, `EMB_API_KEY`, `EMB_MODEL`
+
+**Аргументы bench_emb:**
+
+| Аргумент | Краткий | Описание |
+|---|---|---|
+| `--workers` | `-w` | Количество воркеров (по умолчанию: 4) |
+| `--duration` | `-d` | Длительность в секундах |
+| `--char-counts` | | Список длин текстов в символах |
+| `--batch-sizes` | | Размеры батча (1, 5, 10 и т.д.) |
+| `--model-timeout` | | Таймаут запроса к модели |
+| `--response-width` | | Ширина колонки Input |
+| `--skip-errors` | | Продолжать после ошибки |
+| `--mode` | | `cycling` (зацикливание) или `once` (один проход) |
+
 ### Общие аргументы CLI
 
 | Аргумент | Краткий | Описание |
@@ -221,11 +325,15 @@ llm-speed-benchmark/
 │   ├── bench_single.py              # Одиночный воркер
 │   ├── bench_multi.py               # Многопроцессный воркер
 │   ├── bench_vision.py              # Vision-бенчмарк
-│   ├── bench_audio.py               # Audio-бенчмарк
+│   ├── bench_audio.py               # Audio-бенчмарк (chat.completions)
+│   ├── bench_transcription.py       # ASR-бенчмарк (audio.transcriptions)
+│   ├── bench_tts.py                 # TTS-бенчмарк (audio.speech)
+│   ├── bench_emb.py                 # Embedding-бенчмарк (embeddings)
 │   ├── live_table.py                # BaseLiveTable — общая Live-таблица
 │   ├── worker_common.py             # Общие воркер-хелперы
 │   ├── image_utils.py               # Генерация/загрузка изображений
 │   ├── audio_utils.py               # Загрузка аудио из бандла
+│   ├── transcription_utils.py       # Генерация аудио разной длины для ASR
 │   ├── streaming.py                 # StreamSession + StreamMetrics
 │   ├── cli_common.py                # Общие CLI аргументы
 │   └── utils.py                     # Общие утилиты
@@ -236,9 +344,13 @@ llm-speed-benchmark/
 │   ├── test_bench_multi.py
 │   ├── test_bench_vision.py
 │   ├── test_bench_audio.py
+│   ├── test_bench_transcription.py
+│   ├── test_bench_tts.py
+│   ├── test_bench_emb.py
 │   ├── test_cli_common.py
 │   ├── test_streaming.py
 │   └── test_long_context.py
+├── .env                             # Конфигурация (BASE_URL, API_KEY, MODEL + TRANSCRIPTION_*, TTS_*, EMB_*)
 ├── INSTALL.md                       # Инструкция по установке
 ├── README.md
 └── AGENTS.md
