@@ -43,6 +43,13 @@ MODEL=qwen3.5-0.8b
 MAX_CONTEXT_TOKENS=262144
 ```
 
+Полный список переменных (включая `TRANSCRIPTION_*`, `TTS_*`, `EMB_*`,
+`MULTI_MODEL_TIMEOUT`) — в файле [.env.example](.env.example):
+
+```bash
+cp .env.example .env
+```
+
 | Параметр | Описание |
 |---|---|
 | `BASE_URL` | Адрес LLM-сервера (OpenAI-compatible API) |
@@ -80,6 +87,17 @@ bench_multi -w 4 -d 60                         # 4 воркера, 60 секун
 bench_multi -w 4 -d 60 --response-width 120    # Широкая колонка ответа
 bench_multi -w 4 --max-context 32768           # Переопределение лимита контекста
 bench_multi -u http://localhost:8000/v1 -m qwen3.5-0.8b -w 4 -d 60
+
+# Long context (длинный контекст из BEAM)
+bench_multi -w 4 --long-context-workers 1                # 1 воркер с длинным контекстом
+bench_multi -w 4 --long-context-workers 2 -d 120         # 2 LC-воркера, 120 сек
+bench_multi --long-context-workers 1 --split 500K        # split 500K (430K-1.1M токенов)
+bench_multi --long-context-workers 1 --data-dir ~/datasets/beam  # свои данные
+bench_multi --long-context-workers 1 --no-download       # только локальные данные
+
+# Медленный сервер (долгий prefill) -- без таймаута
+bench_multi --long-context-workers 1 --model-timeout 0   # ждать prefill бесконечно
+bench_multi --long-context-workers 1 --model-timeout 7200  # таймаут 2 часа
 ```
 
 **Особенности:**
@@ -87,6 +105,10 @@ bench_multi -u http://localhost:8000/v1 -m qwen3.5-0.8b -w 4 -d 60
 - При достижении лимита контекста — автоматический новый раунд
 - Live-обновление метрик во время стриминга + wall-time каждую секунду
 - Остановка: `Ctrl+C`
+- **Long context:** `--long-context-workers N` запускает N воркеров с длинным
+  контекстом из датасета BEAM (multi-turn диалоги 100K-2.4M токенов). Если
+  датасета нет на диске — скачивается автоматически с HuggingFace
+  (`Mohammadta/BEAM`, public). Воркер помечается `[LC]` в таблице.
 
 **Метрики таблицы:**
 
@@ -100,6 +122,31 @@ bench_multi -u http://localhost:8000/v1 -m qwen3.5-0.8b -w 4 -d 60
 | Avg | Gen est / время работы воркера |
 | TTFT | Time To First Token последнего вызова |
 | TTFT sum | Суммарный TTFT всех вызовов |
+
+**Аргументы long context (`bench_multi`):**
+
+| Аргумент | Краткий | Описание |
+|---|---|---|
+| `--long-context-workers` | | Количество воркеров с длинным контекстом из BEAM (по умолч. 0) |
+| `--split` | | Сплит BEAM: `100K`, `500K`, `1M` (по умолч. `100K`) |
+| `--data-dir` | | Директория с датасетами (по умолч. `~/workspace/data/llm-speed-benchmark/datasets`) |
+| `--no-download` | | Не скачивать датасет с HuggingFace (только локальные данные) |
+| `--model-timeout` | | Таймаут запроса к модели в сек (0 = без таймаута; по умолч. env `MULTI_MODEL_TIMEOUT` или 600) |
+
+Long context: при старте проверяется реальный контекст модели через API
+(`models.retrieve` → `max_model_len`). Если модель поддерживает меньше, чем
+`MAX_CONTEXT_TOKENS`, лимит автоматически ограничивается до реального значения
+(без остановки). Диалог из BEAM обрезается до `MAX_CONTEXT_TOKENS - 1000`.
+Воркер с длинным контекстом при новом раунде возвращается к диалогу датасета
+(а не к голому system), история датасета не обрезается.
+
+**Таймаут запроса (`--model-timeout`).** Это read-таймаут httpx: максимальное
+ожидание первого чанка (во время prefill сервер не шлёт ни байта) и паузы
+между чанками. По умолчанию 600с. На медленных серверах prefill длинного
+промпта может занять больше — тогда запрос упадёт по таймауту. Для таких
+случаев: `--model-timeout 0` (без таймаута, ждать бесконечно) или большое
+значение (например `--model-timeout 7200` для prefill ~2 часа). Также
+настраивается env `MULTI_MODEL_TIMEOUT` в `.env`.
 
 ### Vision-бенчмарк (`bench_vision`)
 

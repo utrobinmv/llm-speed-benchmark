@@ -672,6 +672,148 @@ class TestWorker:
 
 
 # ============================================================================
+# worker() -- long context
+# ============================================================================
+
+class TestWorkerLongContext:
+    """worker(): long context -- диалог датасета сохраняется между раундами."""
+
+    BEAM = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "BEAM user msg 1"},
+        {"role": "assistant", "content": "BEAM assistant msg 1"},
+        {"role": "user", "content": "BEAM user msg 2"},
+        {"role": "assistant", "content": "BEAM assistant msg 2"},
+    ]
+
+    def test_lc_worker_keeps_dataset_dialog_on_new_round(self):
+        """При достижении лимита контекста long-context воркер
+        возвращается к диалогу датасета, а не к голому system."""
+        q = MagicMock()
+        start_event = MagicMock()
+        start_event.wait.return_value = None
+        captured = []
+
+        def fake_create(**kw):
+            captured.append(list(kw["messages"]))
+            return make_worker_mock_response(prompt_tokens=1000, completion_tokens=5000)
+
+        with patch("llm_speed_benchmark.bench_multi.OpenAI") as mock_openai_cls, \
+             patch("llm_speed_benchmark.bench_multi.MAX_CONTEXT_TOKENS", 4000):
+            mock_client = MagicMock()
+            mock_openai_cls.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = fake_create
+            worker(0, q, start_event, duration=1,
+                   initial_messages=list(self.BEAM), long_context=True)
+
+        assert len(captured) >= 2
+        # Первый вызов: полный диалог датасета + промпт воркера
+        assert captured[0][:5] == self.BEAM
+        assert captured[0][5]["role"] == "user"
+        # Второй вызов (новый раунд): снова полный диалог датасета + промпт
+        assert captured[1][:5] == self.BEAM
+        assert captured[1][5]["role"] == "user"
+        assert "Поток" in captured[1][5]["content"]
+
+    def test_lc_worker_start_message(self):
+        """Start-сообщение помечает long_context=True."""
+        q = MagicMock()
+        start_event = MagicMock()
+        start_event.wait.return_value = None
+
+        with patch("llm_speed_benchmark.bench_multi.OpenAI") as mock_openai_cls, \
+             patch("llm_speed_benchmark.bench_multi.MAX_CONTEXT_TOKENS", 4000):
+            mock_client = MagicMock()
+            mock_openai_cls.return_value = mock_client
+            mock_client.chat.completions.create.return_value = iter([])
+            worker(0, q, start_event, duration=1,
+                   initial_messages=list(self.BEAM), long_context=True)
+
+        calls = [c[0][0] for c in q.put.call_args_list]
+        start = [c for c in calls if c.get("type") == "start"]
+        assert start and start[0]["long_context"] is True
+
+    def test_normal_worker_resets_to_system_on_new_round(self):
+        """Обычный режим (regression): при лимите контекст сбрасывается
+        к голому system, как и раньше."""
+        q = MagicMock()
+        start_event = MagicMock()
+        start_event.wait.return_value = None
+        captured = []
+
+        def fake_create(**kw):
+            captured.append(list(kw["messages"]))
+            return make_worker_mock_response(prompt_tokens=1000, completion_tokens=5000)
+
+        with patch("llm_speed_benchmark.bench_multi.OpenAI") as mock_openai_cls, \
+             patch("llm_speed_benchmark.bench_multi.MAX_CONTEXT_TOKENS", 4000):
+            mock_client = MagicMock()
+            mock_openai_cls.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = fake_create
+            worker(0, q, start_event, duration=1)
+
+        assert len(captured) >= 2
+        # Второй вызов: system + промпт (история сброшена)
+        assert captured[1][0]["role"] == "system"
+        assert captured[1][1]["role"] == "user"
+        assert len(captured[1]) == 2
+
+
+# ============================================================================
+# worker() -- model_timeout
+# ============================================================================
+
+class TestWorkerTimeout:
+    """worker(): таймаут запроса к модели (медленные серверы, долгий prefill)."""
+
+    def test_default_timeout_600(self):
+        """По умолчанию клиент создаётся с timeout=600.0."""
+        q = MagicMock()
+        start_event = MagicMock()
+        start_event.wait.return_value = None
+
+        with patch("llm_speed_benchmark.bench_multi.OpenAI") as mock_openai_cls:
+            mock_client = MagicMock()
+            mock_openai_cls.return_value = mock_client
+            mock_client.chat.completions.create.return_value = iter([])
+            worker(0, q, start_event, duration=1)
+
+        _, kwargs = mock_openai_cls.call_args
+        assert kwargs["timeout"] == 600.0
+
+    def test_custom_timeout_passed_to_client(self):
+        """Явный model_timeout передаётся в OpenAI-клиент."""
+        q = MagicMock()
+        start_event = MagicMock()
+        start_event.wait.return_value = None
+
+        with patch("llm_speed_benchmark.bench_multi.OpenAI") as mock_openai_cls:
+            mock_client = MagicMock()
+            mock_openai_cls.return_value = mock_client
+            mock_client.chat.completions.create.return_value = iter([])
+            worker(0, q, start_event, duration=1, model_timeout=3600.0)
+
+        _, kwargs = mock_openai_cls.call_args
+        assert kwargs["timeout"] == 3600.0
+
+    def test_zero_timeout_means_no_timeout(self):
+        """model_timeout=0 -- клиент без таймаута (timeout=None),
+        ждёт prefill бесконечно."""
+        q = MagicMock()
+        start_event = MagicMock()
+        start_event.wait.return_value = None
+
+        with patch("llm_speed_benchmark.bench_multi.OpenAI") as mock_openai_cls:
+            mock_client = MagicMock()
+            mock_openai_cls.return_value = mock_client
+            mock_client.chat.completions.create.return_value = iter([])
+            worker(0, q, start_event, duration=1, model_timeout=0)
+
+        _, kwargs = mock_openai_cls.call_args
+        assert kwargs["timeout"] is None
+
+
+# ============================================================================
 # CLI -- bench_multi
 # ============================================================================
 
@@ -721,3 +863,154 @@ class TestCliMulti:
                 assert call_kwargs["duration"] == 30
                 assert call_kwargs["response_width"] == 80
                 assert call_kwargs["max_context"] == 32768
+
+    def test_cli_long_context_args(self):
+        from llm_speed_benchmark.bench_multi import cli
+        args = [
+            "bench_multi",
+            "-w", "2",
+            "--long-context-workers", "1",
+            "--split", "500K",
+            "--data-dir", "/tmp/datasets",
+        ]
+        with patch("sys.argv", args):
+            with patch("llm_speed_benchmark.bench_multi.run_benchmark") as mock_run:
+                cli()
+                call_kwargs = mock_run.call_args[1]
+                assert call_kwargs["long_context_workers"] == 1
+                assert call_kwargs["split"] == "500K"
+                assert call_kwargs["data_dir"] == "/tmp/datasets"
+                assert call_kwargs["allow_download"] is True
+
+    def test_cli_no_download(self):
+        from llm_speed_benchmark.bench_multi import cli
+        args = ["bench_multi", "--long-context-workers", "1", "--no-download"]
+        with patch("sys.argv", args):
+            with patch("llm_speed_benchmark.bench_multi.run_benchmark") as mock_run:
+                cli()
+                call_kwargs = mock_run.call_args[1]
+                assert call_kwargs["allow_download"] is False
+
+    def test_cli_model_timeout(self):
+        from llm_speed_benchmark.bench_multi import cli
+        args = ["bench_multi", "--model-timeout", "0"]
+        with patch("sys.argv", args):
+            with patch("llm_speed_benchmark.bench_multi.run_benchmark") as mock_run:
+                cli()
+                call_kwargs = mock_run.call_args[1]
+                assert call_kwargs["model_timeout"] == 0.0
+
+    def test_cli_model_timeout_default_none(self):
+        """Без --model-timeout -- None (разрешается из env/600 в run_benchmark)."""
+        from llm_speed_benchmark.bench_multi import cli
+        args = ["bench_multi"]
+        with patch("sys.argv", args):
+            with patch("llm_speed_benchmark.bench_multi.run_benchmark") as mock_run:
+                cli()
+                call_kwargs = mock_run.call_args[1]
+                assert call_kwargs["model_timeout"] is None
+
+
+# ============================================================================
+# run_benchmark() -- long context: clamp контекста и авто-скачивание
+# ============================================================================
+
+class TestRunBenchmarkLongContext:
+    """run_benchmark(): long context -- clamp контекста, авто-скачивание."""
+
+    def test_clamps_max_context_to_model(self, tmp_path):
+        """Модель поддерживает меньше контекста, чем в .env --
+        MAX_CONTEXT_TOKENS ограничивается до реального (без sys.exit)."""
+        import llm_speed_benchmark.utils as u
+        import llm_speed_benchmark.bench_multi as bm
+        orig = u.MAX_CONTEXT_TOKENS, u.TOKEN_LIMIT_WARN
+        try:
+            with patch.object(bm, "apply_config"), \
+                 patch.object(bm, "Queue"), \
+                 patch.object(bm, "Event"), \
+                 patch.object(bm, "Process") as mock_proc, \
+                 patch.object(bm, "Live"), \
+                 patch.object(bm, "Console"), \
+                 patch.object(bm, "signal"), \
+                 patch.object(u, "get_client"), \
+                 patch.object(u, "detect_model_context_length", return_value=130000), \
+                 patch.object(u, "MODEL", "test-model"), \
+                 patch.object(u, "MAX_CONTEXT_TOKENS", 131072), \
+                 patch("llm_speed_benchmark.long_context.ensure_beam_data"), \
+                 patch("llm_speed_benchmark.long_context.LongContextDataset") as mock_ds_cls:
+                mock_proc.return_value.start.return_value = None
+                mock_ds_cls.return_value.get_conversations_info.return_value = [1]
+                mock_ds_cls.return_value.get_messages.return_value = [
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": "u"},
+                ]
+                bm.run_benchmark(workers=1, duration=1, long_context_workers=1,
+                                 data_dir=str(tmp_path))
+                # Контекст ограничен до реального значения модели
+                assert u.MAX_CONTEXT_TOKENS == 130000
+                # Обрезка диалога -- до реального контекста минус запас
+                mock_ds_cls.return_value.get_messages.assert_called_once()
+                call_kwargs = mock_ds_cls.return_value.get_messages.call_args[1]
+                assert call_kwargs["max_tokens"] == 130000 - 1000
+        finally:
+            u.MAX_CONTEXT_TOKENS, u.TOKEN_LIMIT_WARN = orig
+
+    def test_auto_download_triggered_when_data_missing(self, tmp_path):
+        """Датасета нет на диске -- вызывается ensure_beam_data (скачивание)."""
+        import llm_speed_benchmark.utils as u
+        import llm_speed_benchmark.bench_multi as bm
+        with patch.object(bm, "apply_config"), \
+             patch.object(bm, "Queue"), \
+             patch.object(bm, "Event"), \
+             patch.object(bm, "Process") as mock_proc, \
+             patch.object(bm, "Live"), \
+             patch.object(bm, "Console"), \
+             patch.object(bm, "signal"), \
+             patch.object(u, "get_client"), \
+             patch.object(u, "detect_model_context_length", return_value=131072), \
+             patch.object(u, "MODEL", "test-model"), \
+             patch.object(u, "MAX_CONTEXT_TOKENS", 131072), \
+             patch("llm_speed_benchmark.long_context.ensure_beam_data") as mock_ensure, \
+             patch("llm_speed_benchmark.long_context.LongContextDataset") as mock_ds_cls:
+            mock_proc.return_value.start.return_value = None
+            mock_ds_cls.return_value.get_conversations_info.return_value = [1]
+            mock_ds_cls.return_value.get_messages.return_value = [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+            ]
+            bm.run_benchmark(workers=1, duration=1, long_context_workers=1,
+                             data_dir=str(tmp_path))
+            mock_ensure.assert_called_once()
+            call_args, call_kwargs = mock_ensure.call_args
+            assert call_args[0] == str(tmp_path)
+            assert call_args[1] == "100K"
+            assert call_kwargs["allow_download"] is True
+
+    def test_model_timeout_passed_to_worker(self, tmp_path):
+        """run_benchmark пробрасывает model_timeout в аргументы воркера."""
+        import llm_speed_benchmark.utils as u
+        import llm_speed_benchmark.bench_multi as bm
+        with patch.object(bm, "apply_config"), \
+             patch.object(bm, "Queue"), \
+             patch.object(bm, "Event"), \
+             patch.object(bm, "Process") as mock_proc, \
+             patch.object(bm, "Live"), \
+             patch.object(bm, "Console"), \
+             patch.object(bm, "signal"), \
+             patch.object(u, "get_client"), \
+             patch.object(u, "detect_model_context_length", return_value=131072), \
+             patch.object(u, "MODEL", "test-model"), \
+             patch.object(u, "MAX_CONTEXT_TOKENS", 131072), \
+             patch("llm_speed_benchmark.long_context.ensure_beam_data"), \
+             patch("llm_speed_benchmark.long_context.LongContextDataset") as mock_ds_cls:
+            mock_proc.return_value.start.return_value = None
+            mock_ds_cls.return_value.get_conversations_info.return_value = [1]
+            mock_ds_cls.return_value.get_messages.return_value = [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+            ]
+            bm.run_benchmark(workers=1, duration=1, long_context_workers=1,
+                             data_dir=str(tmp_path), model_timeout=0)
+            # args воркера: (id, q, start_event, duration, msgs, skip, lc, timeout)
+            proc_args = mock_proc.call_args[1]["args"]
+            assert proc_args[7] == 0  # model_timeout=0 (без таймаута)

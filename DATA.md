@@ -8,6 +8,13 @@
 
 ### Скачивание
 
+Датасет скачивается **автоматически** при первом запуске
+`bench_multi --long-context-workers N` (если файлов нет на диске) —
+`ensure_beam_data()` в `long_context.py` качает нужный split с HuggingFace
+через stdlib (`urllib`) с докачкой и ретраями.
+
+Ручное скачивание (опционально, чтобы не качать при запуске):
+
 ```bash
 hf download --repo-type dataset Mohammadta/BEAM \
     --local-dir ~/workspace/data/llm-speed-benchmark/datasets/beam/
