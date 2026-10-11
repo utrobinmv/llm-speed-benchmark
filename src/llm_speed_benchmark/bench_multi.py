@@ -449,10 +449,14 @@ def run_benchmark(
                     max_tokens=_u.MAX_CONTEXT_TOKENS - 1000,
                 )
                 long_context_messages.append(msgs)
-            console = Console()
-            console.print(
-                f"   [cyan]Long context:[/] {long_context_workers} воркер(ов) "
-                f"из split={split}"
+            ds_data_path = os.path.join(ds_data_dir, "beam", "data")
+            print(
+                f"   Long context: {long_context_workers} воркер(ов) из split={split}",
+                flush=True,
+            )
+            print(
+                f"   Данные для long context взяты из датасета: {ds_data_path}",
+                flush=True,
             )
         except Exception as e:
             print(f"   Warning: не удалось загрузить long context: {e}")

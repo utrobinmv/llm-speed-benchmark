@@ -96,7 +96,7 @@ def _download_file(url: str, dest: Path, retries: int = 3, timeout: int = 120) -
             return
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last_err = e
-            print(f"   Скачивание {url.split('/')[-1]} (попытка {attempt}/{retries}): {e}")
+            print(f"   Скачивание {url.split('/')[-1]} (попытка {attempt}/{retries}): {e}", flush=True)
             time.sleep(2 * attempt)
     raise RuntimeError(f"Не удалось скачать {url}: {last_err}")
 
@@ -143,14 +143,14 @@ def ensure_beam_data(data_dir: str, split: str, allow_download: bool = True) -> 
             rel = match[0]
     except Exception as e:  # noqa: BLE001
         print(f"   Warning: не удалось получить список файлов HF ({e}), "
-              f"использую {rel}")
+              f"использую {rel}", flush=True)
 
     url = f"{BEAM_HF_RESOLVE}/{rel}"
     dest = data_path / rel.split("/")[-1]
     size_hint = {"100K": "~5 МБ", "500K": "~34 МБ", "1M": "~66 МБ"}.get(split, "")
-    print(f"   Long context: датасет не найден, скачиваю BEAM split={split} {size_hint}...")
+    print(f"   Long context: датасет не найден, скачиваю BEAM split={split} {size_hint}...", flush=True)
     _download_file(url, dest)
-    print(f"   Сохранено: {dest}")
+    print(f"   Сохранено: {dest}", flush=True)
     return data_path
 
 

@@ -715,7 +715,54 @@ class TestWorkerLongContext:
         assert captured[1][5]["role"] == "user"
         assert "Поток" in captured[1][5]["content"]
 
-    def test_lc_worker_start_message(self):
+    def test_lc_worker_sends_long_messages_in_chars(self):
+        """Long-context воркер отправляет длинный диалог в API.
+        Замокан сам вызов API (OpenAI.chat.completions.create) -- сеть не
+        трогается. Проверяется длина отправленных сообщений в символах:
+        при --long-context-workers 1 в первый же вызов должны уйти все
+        сообщения датасета (сотни тысяч символов), а НЕ короткий промпт.
+        """
+        q = MagicMock()
+        start_event = MagicMock()
+        start_event.wait.return_value = None
+        captured = []
+
+        # Имитация диалога BEAM (близкая по масштабу к реальной 100K-записи):
+        # длинный system + 60 пар user/assistant по ~3000 символов каждая.
+        beam_dialog = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(60):
+            beam_dialog.append(
+                {"role": "user", "content": f"Long user message #{i}: " + "x" * 2500}
+            )
+            beam_dialog.append(
+                {"role": "assistant", "content": f"Long assistant reply #{i}: " + "y" * 2500}
+            )
+        total_expected = sum(len(m["content"]) for m in beam_dialog)
+
+        def fake_create(**kw):
+            captured.append(list(kw["messages"]))
+            return make_worker_mock_response(prompt_tokens=98038, completion_tokens=100)
+
+        with patch("llm_speed_benchmark.bench_multi.OpenAI") as mock_openai_cls:
+            mock_client = MagicMock()
+            mock_openai_cls.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = fake_create
+            worker(0, q, start_event, duration=1,
+                   initial_messages=list(beam_dialog), long_context=True)
+
+        assert captured, "воркер должен был сделать хотя бы один вызов API"
+        sent = captured[0]
+
+        # В первый вызов уходят ВСЕ сообщения датасета (диалог + промпт воркера)
+        assert len(sent) == len(beam_dialog) + 1  # +1 пользовательский промпт
+        total_chars = sum(len(m["content"]) for m in sent)
+        print(f"[SENT] messages={len(sent)} total_chars={total_chars} "
+              f"(датасет={total_expected})")
+        # Длина на порядок больше короткого промпта -- диалог ушёл целиком
+        assert total_chars >= total_expected
+        assert total_chars > 100_000, \
+            f"Отправлено всего {total_chars} символов -- это не длинный контекст!"
+        assert total_expected > 100_000, "тестовый диалог слишком короткий"
         """Start-сообщение помечает long_context=True."""
         q = MagicMock()
         start_event = MagicMock()
