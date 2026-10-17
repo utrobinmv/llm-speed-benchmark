@@ -7,9 +7,7 @@ llm_speed_benchmark/transcription_utils.py
 
 from __future__ import annotations
 
-import io
 import os
-import struct
 import wave
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +21,25 @@ _CACHE_DIR = Path(os.path.expanduser("~/.llm-speed-benchmark/tmp/transcription")
 DEFAULT_TRANSCRIPTION_PROMPTS = [
     "Transcribe this audio.",
 ]
+
+
+def _bundle_fingerprint(audios: List[Path]) -> str:
+    """Отпечаток содержимого исходных аудио для ключа кэша.
+
+    Использует (имя, mtime_ns, size) по каждому файлу — дешевле, чем
+    чтение байтов, и достаточно надёжно ловит правки/замену файлов.
+    Для пустого/некорректного бандла возвращает 'empty'.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for p in sorted(audios):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        h.update(f"{p.name}:{st.st_mtime_ns}:{st.st_size};".encode())
+    return h.hexdigest()[:12]
 
 
 def get_audio_duration(audio_path: str | Path) -> float:
@@ -118,38 +135,72 @@ def generate_audio_at_duration(
         raise FileNotFoundError("No bundled audio files found")
 
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = _CACHE_DIR / f"audio_{int(target_duration * 100)}s.wav"
+    # Ключ кэша включает параметры формата И отпечаток содержимого исходных
+    # аудио (mtime+size): иначе правка/замена бандла вернула бы устаревший
+    # кэш без перегенерации, искажая результаты бенчмарка.
+    src_fp = _bundle_fingerprint(bundled_audios)
+    cache_file = _CACHE_DIR / (
+        f"audio_{int(target_duration * 100)}s_"
+        f"{sample_rate}_{channels}_{sampwidth}_{src_fp}.wav"
+    )
 
     if cache_file.exists():
         return cache_file
 
-    # Считываем все бандл-аудио и циклически повторяем до нужной длины
-    total_samples = int(target_duration * sample_rate)
-
-    # Собираем raw frames из бандла
+    # Считываем все бандл-аудио и циклически повторяем до нужной длины.
+    # Все WAV-источники валидируются на ЕДИНЫЙ формат между собой, чтобы
+    # конкатенация raw-фреймов была корректной. Совпадение с целевыми
+    # параметрами вывода не требуется: на выходе файл пересоздаётся
+    # с target sample_rate/channels/sampwidth. (При ином sample_rate
+    # у источников pitch/темп сохраняется лишь приблизительно — для
+    # полного ресемплинга нужен внешний декодер.)
     source_frames: List[bytes] = []
-    source_sample_rate = sample_rate
+    source_format: Optional[Tuple[int, int, int]] = None  # (rate, sampwidth, channels)
 
     for audio_path in bundled_audios:
         suffix = audio_path.suffix.lower()
         if suffix == ".wav":
             with wave.open(str(audio_path), "rb") as w:
-                sr = w.getframerate()
-                source_sample_rate = sr  # use last file's rate
+                fmt = (w.getframerate(), w.getsampwidth(), w.getnchannels())
+                if source_format is None:
+                    source_format = fmt
+                elif source_format != fmt:
+                    raise ValueError(
+                        "Bundled audio files are not in a uniform format: "
+                        f"{source_format} vs {fmt}. Нормализуйте источники "
+                        "к одному формату (rate/sampwidth/channels)."
+                    )
                 nframes = w.getnframes()
                 raw = w.readframes(nframes)
                 source_frames.append(raw)
         else:
-            # Для не-WAV просто читаем raw bytes
-            source_frames.append(audio_path.read_bytes())
+            # Не-WAV источник (mp3/ogg/flac/...): в этом модуле нет декодера,
+            # а его байты В КОМПРЕССИРОВАННОМ виде нельзя трактовать как PCM-
+            # фреймы целевого формата — это дало бы испорченный звук в пуле.
+            # Требуем либо WAV-источники (единый формат), либо конвертацию
+            # заранее. (Для одиночного файла есть отдельный путь, не сюда.)
+            raise ValueError(
+                f"Bundled-аудио содержит не-WAV источник: {audio_path.name}. "
+                f"При сборке пула поддерживаются только WAV-файлы единого "
+                f"формата (rate/sampwidth/channels). Конвертируйте источник "
+                f"в WAV или исключите его из бандла."
+            )
 
     # Объединяем все бандл-фреймы в один пул
     pool = b"".join(source_frames)
     if not pool:
         raise ValueError("No audio data found in bundled files")
 
-    # Рассчитываем длительность пула
-    pool_duration = len(pool) / (sampwidth * sample_rate * channels)
+    # Целевой размер в сэмплах и байтах по целевому формату вывода
+    total_samples = int(target_duration * sample_rate)
+    # Рассчитываем длительность пула по фактическому формату источника
+    # (влияет только на запас повторений; точный размер задаёт total_samples)
+    if source_format is not None:
+        pool_duration = len(pool) / (
+            source_format[1] * source_format[0] * source_format[2]
+        )
+    else:
+        pool_duration = len(pool) / (sampwidth * sample_rate * channels)
     if pool_duration <= 0:
         raise ValueError("Audio pool duration is zero")
 

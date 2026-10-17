@@ -34,6 +34,7 @@ import signal
 import argparse
 import traceback
 from multiprocessing import Process, Queue, Event
+from queue import Empty as QueueEmpty
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -164,11 +165,22 @@ def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
             media_count_ref=media_count_ref,
         )
 
+        # Обёртка: во время активного вызова увеличиваем in-flight counter
+        # в _state для time-sender'а (live avg должен учитывать и текущий
+        # незавершённый call, а не только завершённые). При каждом успешном
+        # вызове (ниже) счётчик снова сбрасывается в 0.
+        _base_on_chunk = _on_chunk
+
+        def _on_chunk_with_state(*args, **kwargs):  # type: ignore[no-untyped-def]
+            with _state_lock:
+                _state["chunk_count"] = _state.get("chunk_count", 0) + 1
+            return _base_on_chunk(*args, **kwargs)
+
+        _on_chunk = _on_chunk_with_state
+
         start_event.wait()
 
         while duration is None or (time.time() - start_time < duration):
-            wall_total = time.time() - start_time
-            
             selected_images: List[str] = []
             selected_videos: List[str] = []
 
@@ -214,7 +226,6 @@ def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
                     break
                 prompt = prompts[prompt_index % len(prompts)]
                 messages = build_video_message(selected_videos, prompt)
-                current_vid_count = current_vid_count  # already set
 
             else:
                 # image-only mode
@@ -236,6 +247,12 @@ def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
             try:
                 # Обновляем media_count перед вызовом
                 media_count_ref[0] = current_img_count + current_vid_count
+                # Счётчик чанков обнуляем перед каждым запросом, чтобы
+                # live-поток от time-sender отражал только текущий запрос,
+                # независимо от исхода (success или error) — иначе после
+                # ошибки (skip_errors=True) останется устаревший wait.
+                with _state_lock:
+                    _state["chunk_count"] = 0
                 session.on_chunk = _on_chunk
                 session.on_chunk_args = {
                     "start_time": start_time,
@@ -319,7 +336,6 @@ def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
 
             with _state_lock:
                 _state["total_gen"] = total_gen
-                _state["chunk_count"] = 0
 
             send_mixed_stats(q, worker_id, call_count, metrics,
                                  total_gen=total_gen,
@@ -707,15 +723,13 @@ def run_benchmark(
             if stop_requested:
                 break
 
-            # Проверка duration
-            if duration is not None:
-                alive = any(p.is_alive() for p in processes)
-                if not alive:
-                    break
+            # Останавливаемся, когда все воркеры вышли (независимо от duration).
+            if not any(p.is_alive() for p in processes):
+                break
 
             try:
                 msg = q.get(timeout=0.5)
-            except Exception:
+            except QueueEmpty:
                 msg = None
 
             if msg is None:

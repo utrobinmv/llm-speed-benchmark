@@ -12,6 +12,7 @@ llm_speed_benchmark/bench_single.py
 
 import sys
 import time
+
 import argparse
 
 from .utils import (
@@ -23,6 +24,11 @@ from .utils import (
 )
 from .cli_common import add_common_args, apply_config
 from .streaming import StreamSession
+
+# Сколько раз подряд модель может вернуть пустой ответ до отказа от цикла:
+# пустой ответ не продвигает ни историю, ни расход контекста, так что без
+# этого ограничения при duration=None цикл был бы бесконечным.
+_MAX_EMPTY_TURNS = 20
 
 
 def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_context=None):
@@ -69,6 +75,7 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
     prompt_tokens = 0
     start_wall = time.time()
     turn = 0
+    consecutive_empty = 0
     last_tick = time.time()
 
     # Суммарный TTFT (Time To First Token) по всем turn'ам
@@ -96,14 +103,10 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
             last_tick = time.time()
 
             # === Streaming через StreamSession ===
-            try:
-                metrics = session.run(
-                    messages=messages,
-                    model=_u.MODEL,
-                )
-            except Exception as e:  # noqa: BLE001
-                print(f"\r\033[2KCall {turn:>3} | [red]Ошибка: {e}[/red]")
-                raise
+            metrics = session.run(
+                messages=messages,
+                model=_u.MODEL,
+            )
 
             completion_tokens = metrics.completion_tokens
             prompt_tokens = metrics.prompt_tokens
@@ -140,7 +143,17 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
             wall_total = time.time() - start_wall
 
             # Защита: если модель ничего не вернула -- пропускаем turn
-            if completion_tokens == 0:
+            # (учитываем и chunk-счётчик: если токены считались только по
+            # чанкам, completion_tokens может быть 0 при реальной генерации).
+            if completion_tokens == 0 and chunk_count == 0:
+                consecutive_empty += 1
+                # Много пустых ответов подряд = модель сломана/блокирует:
+                # дальше крутить цикл бессмысленно (при duration=None это
+                # был бы бесконечный цикл без прогресса по контексту).
+                if consecutive_empty >= _MAX_EMPTY_TURNS:
+                    print(f"\r\033[2KCall {turn:>3} | Пустых ответов подряд: "
+                          f"{consecutive_empty}, прекращаю...")
+                    break
                 print(f"\r\033[2KCall {turn:>3} | Внимание: пустой ответ, пропускаю...")
                 continue
 

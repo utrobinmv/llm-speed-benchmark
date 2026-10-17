@@ -19,6 +19,7 @@ import argparse
 import traceback
 from datetime import datetime
 from multiprocessing import Process, Queue, Event
+from queue import Empty as QueueEmpty
 
 from openai import OpenAI
 from rich.console import Console
@@ -41,6 +42,11 @@ from .live_table import BaseLiveTable
 from .worker_common import make_time_sender, make_on_chunk_callback, send_stats, send_error_stats
 
 
+# Максимум подряд идущих ошибок воркера до принудительного останова
+# (защита от busy-loop, когда skip_errors=True при устойчивом сбое API).
+MAX_CONSECUTIVE_ERRORS = 10
+
+
 def worker(  # type: ignore[reportInvalidTypeForm]
     worker_id: int,
     q: "Queue",
@@ -50,6 +56,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
     skip_errors: bool = False,
     long_context: bool = False,
     model_timeout: float = 600.0,
+    max_context: int | None = None,
 ) -> None:
     """Запускает цикл вызовов LLM в отдельном процессе.
 
@@ -67,7 +74,13 @@ def worker(  # type: ignore[reportInvalidTypeForm]
             httpx: ожидание первого чанка и паузы между чанками).
             0 или отрицательное значение -- без таймаута (ждать бесконечно,
             нужно для очень медленных серверов с долгим prefill).
+        max_context: Реальный лимит контекста (токенов). Если на родителе
+            был обнаружен меньший контекст модели, именно это значение
+            использует воркер для сброса раунда и предупреждения об обрезке.
     """
+    # Лимит контекста: переданный (обнаруженный родителем) либо дефолтный
+    ctx_limit = max_context if max_context else MAX_CONTEXT_TOKENS
+    ctx_warn = int(ctx_limit * 0.85)
     try:
         timeout = model_timeout if model_timeout and model_timeout > 0 else None
         client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=timeout)
@@ -96,6 +109,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
         round_num = 1
         total_ttft = 0.0
         ttft_count = 0
+        consecutive_errors = 0  # подряд идущие ошибки (защита от busy-loop)
 
         start_event.wait()  # Синхронизация старта
 
@@ -118,7 +132,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
                 prompt_text = f"Поток {worker_id:07d} (раунд {round_num}) продолжай"
 
             # Проверка лимита контекста -- новый раунд
-            if prompt_tokens + total_gen >= MAX_CONTEXT_TOKENS:
+            if prompt_tokens + total_gen >= ctx_limit:
                 # Long context: возвращаемся к диалогу из датасета,
                 # обычный режим: сброс к голому system.
                 messages = list(base_messages)
@@ -132,7 +146,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
 
             # Обрезка истории только в обычном режиме.
             # В long context история -- сам датасет, её не трогаем.
-            if not is_long_context and prompt_tokens + total_gen >= _token_limit_warn():
+            if not is_long_context and prompt_tokens + total_gen >= ctx_warn:
                 messages = truncate_history(messages)
 
             messages.append({"role": "user", "content": prompt_text})
@@ -154,17 +168,27 @@ def worker(  # type: ignore[reportInvalidTypeForm]
                 )
 
                 assistant_content = metrics.assistant_content
+                consecutive_errors = 0  # успешный вызов сбрасывает счётчик
 
             except Exception as e:  # noqa: BLE001
-                q.put({
-                    "type": "error_stop",
-                    "id": worker_id,
-                    "error": str(e),
-                    "calls": call_count,
-                    "wall": format_time(time.time() - start_time),
-                })
-                if not skip_errors:
+                consecutive_errors += 1
+                # Защита от бесконечного busy-loop при skip_errors=True
+                # под устойчивым сбоем (плохой ключ, модель недоступна):
+                # после MAX подряд идущих ошибок уходим в error_stop,
+                # чтобы родитель завершил воркер, даже если skip_errors=True.
+                hard_stop = not skip_errors or consecutive_errors >= MAX_CONSECUTIVE_ERRORS
+                if hard_stop:
+                    q.put({
+                        "type": "error_stop",
+                        "id": worker_id,
+                        "error": str(e),
+                        "calls": call_count,
+                        "wall": format_time(time.time() - start_time),
+                    })
                     break
+                # Soft-путь (skip_errors=True, лимит ещё не исчерпан):
+                # воркер продолжает работу — НЕ шлём error_stop (иначе родитель
+                # решит, что воркер остановлен, хотя он продолжает слать stats).
                 assistant_content = f"[red]Error: {e}[/]"
 
             if assistant_content and not assistant_content.startswith("[red]Error:"):
@@ -423,8 +447,7 @@ def run_benchmark(
                       f"{_u.MAX_CONTEXT_TOKENS:,}.")
                 print(f"   Ограничиваю MAX_CONTEXT_TOKENS до {actual_context} "
                       f"(для переопределения вручную: --max-context {actual_context}).")
-                _u.MAX_CONTEXT_TOKENS = actual_context
-                _u.TOKEN_LIMIT_WARN = _u._token_limit_warn()
+                _u.set_max_context(actual_context)
             else:
                 print(f"   Long context: контекст модели {_u.MODEL} = "
                       f"{actual_context:,} токенов.")
@@ -493,7 +516,7 @@ def run_benchmark(
         initial_msgs = long_context_messages[i] if is_lc else None
         p = Process(
             target=worker,
-            args=(i, q, start_event, duration, initial_msgs, skip_errors, is_lc, model_timeout),
+            args=(i, q, start_event, duration, initial_msgs, skip_errors, is_lc, model_timeout, _u.MAX_CONTEXT_TOKENS),
             name=f"worker-{i}",
         )
         p.start()
@@ -526,7 +549,8 @@ def run_benchmark(
                     console.print(f"[red] Воркер {msg_id} остановлен: {msg.get('error', 'unknown')[:100]}[/]")
 
                 live.update(live_table)
-            except Exception:
+            except QueueEmpty:
+                # Ожидаемый таймаут q.get() — просто нет новых сообщений.
                 pass
     except KeyboardInterrupt:
         sigint_handler(None, None)

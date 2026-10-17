@@ -11,6 +11,7 @@ llm_speed_benchmark/image_utils.py
 from __future__ import annotations
 
 import base64
+import math
 import os
 import random
 import subprocess
@@ -42,7 +43,9 @@ def generate_test_images(
     if count < 4:
         count = 4
 
-    random.seed(seed)
+    # Per-item генераторы сеются через independent random.Random(seed + i);
+    # НЕ трогаем глобальный random.seed() — это меняло бы глобальный RNG процесса
+    # и молча влияло бы на несвязанный код.
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -251,10 +254,8 @@ def _gen_rainbow(size: Tuple[int, int], rng: random.Random) -> "Image.Image":
 
 
 def _sin(x: float) -> float:
-    """Простая аппроксимация sin без import math."""
-    # Taylor series: sin(x) ~ x - x^3/6 + x^5/120
-    x = x % (2 * 3.14159)
-    return x - (x ** 3) / 6 + (x ** 5) / 120
+    """Корректный sin (math.sin) для любых углов до полного периода."""
+    return math.sin(x)
 
 
 def load_image_as_base64(image_path: str | Path) -> str:
@@ -387,7 +388,8 @@ def generate_test_videos(
     if count < 1:
         count = 1
 
-    random.seed(seed)
+    # Per-item генераторы сеются через random.Random(seed + i); глобальный
+    # random.seed() здесь избыточен и лишь засорял бы процесс-глобальный RNG.
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -531,27 +533,36 @@ def _frames_to_mp4(frames: List["Image.Image"], output_path: str, fps: int) -> N
             "ffmpeg не найден. Установите ffmpeg или укажите свои видео через --videos."
         )
 
-    width, height = frames[0].size
+    if not frames:
+        raise ValueError("_frames_to_mp4: пустой список кадров (frames) — нечего кодировать")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # Сохраняем кадры как PNG
         for i, frame in enumerate(frames):
             frame.save(os.path.join(tmpdir, f"frame_{i:04d}.png"))
 
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-framerate", str(fps),
-                "-i", os.path.join(tmpdir, "frame_%04d.png"),
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-preset", "ultrafast",
-                output_path,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=60,
-        )
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-framerate", str(fps),
+                    "-i", os.path.join(tmpdir, "frame_%04d.png"),
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-preset", "ultrafast",
+                    output_path,
+                ],
+                check=True,
+                capture_output=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError(
+                f"ffmpeg не уложился в 60s при кодировании видео "
+                f"(кадров: {len(frames)}, fps: {fps}). "
+                f"Уменьшите разрешение/число кадров."
+            ) from exc
 
 
 def _ffmpeg_available() -> bool:

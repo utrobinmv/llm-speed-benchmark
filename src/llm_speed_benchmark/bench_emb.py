@@ -25,6 +25,7 @@ import time
 import traceback
 from multiprocessing import Event, Process, Queue
 from pathlib import Path
+from queue import Empty as QueueEmpty
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
@@ -107,6 +108,11 @@ BATCH_TEXTS: List[List[str]] = [
         "Лошадь скачет по полю.",
     ],
 ]
+
+
+# Максимум подряд идущих ошибок воркера до принудительного останова
+# (защита от busy-loop, когда skip_errors=True при устойчивом сбое API).
+MAX_CONSECUTIVE_ERRORS = 10
 
 
 def build_emb_tasks(
@@ -233,8 +239,8 @@ def _worker(  # type: ignore[valid-type]
     total_docs = 0
     total_processing_time = 0.0
     total_ttft = 0.0
-    ttft_count = 0
     task_index = 0
+    consecutive_errors = 0  # подряд идущие ошибки (защита от busy-loop)
 
     total_chars_ref: list[int] = [0]
     total_docs_ref: list[int] = [0]
@@ -295,18 +301,24 @@ def _worker(  # type: ignore[valid-type]
                     model=MODEL,
                     input=texts if len(texts) > 1 else texts[0],
                 )
+                if not response.data:
+                    raise ValueError("Empty embeddings response (no data)")
 
                 processing_time = time.time() - processing_start
                 first_chunk_time = processing_time
 
                 # Размерность эмбединга
-                emb_dim = 0
-                if response.data and len(response.data) > 0:
-                    emb_dim = len(response.data[0].embedding)
+                emb_dim = len(response.data[0].embedding)
+                consecutive_errors = 0  # успех: сброс счётчика ошибок
 
             except Exception as exc:  # noqa: BLE001
                 error_msg = str(exc)
-                if not skip_errors:
+                consecutive_errors += 1
+                # Защита от busy-loop при skip_errors=True под устойчивым
+                # сбоем (плохой ключ/модель недоступна): после MAX подряд
+                # идущих ошибок уходим в error_stop, чтобы родитель завершил
+                # воркер, даже если skip_errors=True.
+                if not skip_errors or consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     q.put({
                         "type": "error_stop",
                         "id": worker_id,
@@ -326,7 +338,6 @@ def _worker(  # type: ignore[valid-type]
             total_processing_time += processing_time
             if first_chunk_time is not None:
                 total_ttft += first_chunk_time
-                ttft_count += 1
 
             total_chars_ref[0] = total_chars
             total_docs_ref[0] = total_docs
@@ -609,14 +620,17 @@ def run_benchmark(
             if stop_requested:
                 break
 
-            if duration is not None and mode == "cycling":
-                alive = any(p.is_alive() for p in processes)
-                if not alive:
-                    break
+            # Остановка, если все воркеры вышли: это корректно для режима
+            # "once" (отработали пул задач) и для "cycling" при краше/всех
+            # error_stop или достижении duration. Проверяем без привязки к
+            # duration, иначе при duration=None (default) main loop зависнет
+            # на q.get() после завершения воркеров.
+            if not any(p.is_alive() for p in processes):
+                break
 
             try:
                 msg = q.get(timeout=0.5)
-            except Exception:
+            except QueueEmpty:
                 msg = None
 
             if msg is None:

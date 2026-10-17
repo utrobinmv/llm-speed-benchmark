@@ -83,6 +83,9 @@ class StreamSession:
         Returns:
             StreamMetrics с результатами вызова.
         """
+        # Отсчёт от начала ВСЕГО вызова (включая клиентскую подготовку,
+        # сеть и очередь сервера). TTFT/elapsed — это wall-clock от начала
+        # вызова, а не чистого времени генерации модели.
         turn_start = time.time()
 
         response = self.client.chat.completions.create(
@@ -99,6 +102,7 @@ class StreamSession:
         assistant_content = ""
         chunk_count = 0
         first_token_time = None
+        usage_seen = False  # пришёл ли от API блок usage (include_usage)
 
         # Для мгновенной скорости: (timestamp, cumulative_chunk)
         instant_buffer: list[tuple[float, int]] = []
@@ -107,6 +111,7 @@ class StreamSession:
 
         for chunk in response:
             if chunk.usage:
+                usage_seen = True
                 prompt_tokens = chunk.usage.prompt_tokens or 0
                 completion_tokens = chunk.usage.completion_tokens or 0
 
@@ -128,6 +133,11 @@ class StreamSession:
                         if first_token_time is None:
                             first_token_time = now_chunk
                         instant_buffer.append((now_chunk, chunk_count))
+                        # _instant_speed читает только последние ~6 записей;
+                        # обрезаем буфер, чтобы он не рос бесконечно на
+                        # длинных генерациях.
+                        if len(instant_buffer) > 8:
+                            del instant_buffer[:-6]
 
                         # Live callback (throttle 0.5s)
                         if self.on_chunk and (now_chunk - last_chunk_send >= 0.5):
@@ -149,6 +159,28 @@ class StreamSession:
                             )
                             last_chunk_send = now_chunk
 
+        # Финальный on_chunk: всегда сообщаем терминальное состояние, когда были
+        # чанки. Троттлинг (<0.5s между окнами) может пропустить последний
+        # снапшот, поэтому финальный вызов гарантирует актуальные финальные
+        # значения потребителям live-прогресса (быстрые ответы, конец потока).
+        if self.on_chunk and chunk_count > 0:
+            inst_sp_final = self._instant_speed(instant_buffer)
+            ttft_final = (
+                round((first_token_time or turn_start) - turn_start, 2)
+                if first_token_time is not None
+                else None
+            )
+            wall_final = time.time() - self.on_chunk_args.get(
+                "start_time", turn_start
+            )
+            self.on_chunk(
+                chunk_count,
+                inst_sp_final,
+                ttft_final,
+                assistant_content[-100:],
+                wall_final,
+            )
+
         elapsed = time.time() - turn_start
 
         # TTFT
@@ -160,8 +192,11 @@ class StreamSession:
         # Call speed
         call_speed = completion_tokens / elapsed if elapsed > 0 and completion_tokens > 0 else 0
 
-        # Fallback: если usage не пришло
-        if completion_tokens == 0:
+        # Fallback: если usage так и не пришло (провайдер игнорирует include_usage) —
+        # и только в этом случае оцениваем completion по числу чанков.
+        # Если usage ВЕРНУЛОСЬ и честно дало 0 токенов (пустая генерация),
+        # то 0 сохраняем: иначе затирали бы легитимный пустой результат.
+        if completion_tokens == 0 and not usage_seen:
             completion_tokens = chunk_count
 
         return StreamMetrics(

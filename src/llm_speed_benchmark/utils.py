@@ -4,6 +4,7 @@ llm_speed_benchmark/utils.py
 Общие утилиты для bench_single и bench_multi.
 """
 
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -25,6 +26,20 @@ INSTANT_WINDOW = 200
 def _token_limit_warn():
     """85% от MAX_CONTEXT_TOKENS — пересчитывается динамически."""
     return int(MAX_CONTEXT_TOKENS * 0.85)
+
+
+token_limit_warn = _token_limit_warn  # публичный алиас (без подчёркивания)
+
+
+def set_max_context(value: int) -> None:
+    """Устанавливает MAX_CONTEXT_TOKENS и синхронизирует TOKEN_LIMIT_WARN.
+
+    Единая точка изменения лимита: оба значения обновляются вместе,
+    чтобы порог предупреждения не рассинхронизировался с лимитом.
+    """
+    global MAX_CONTEXT_TOKENS, TOKEN_LIMIT_WARN
+    MAX_CONTEXT_TOKENS = int(value)
+    TOKEN_LIMIT_WARN = _token_limit_warn()
 
 
 TOKEN_LIMIT_WARN = _token_limit_warn()
@@ -53,8 +68,14 @@ def detect_model_context_length(client: OpenAI, model: str) -> int:
         max_len = getattr(model_info, "max_model_len", None)
         if max_len is not None and isinstance(max_len, int) and max_len > 0:
             return max_len
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # models.retrieve() поддерживается не всеми OpenAI-совместимыми
+        # серверами — fallback на MAX_CONTEXT_TOKENS. Логируем (не молча):
+        # DEBUG, чтобы не шуметь, но видно при диагностике.
+        logging.getLogger(__name__).debug(
+            "detect_model_context_length: retrieve(%r) не удался: %s",
+            model, exc,
+        )
 
     return MAX_CONTEXT_TOKENS
 
