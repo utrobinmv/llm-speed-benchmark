@@ -48,6 +48,8 @@ def worker(  # type: ignore[reportInvalidTypeForm]
     duration: int | None,
     initial_messages: list[dict] | None = None,
     skip_errors: bool = False,
+    long_context: bool = False,
+    model_timeout: float = 600.0,
 ) -> None:
     """Запускает цикл вызовов LLM в отдельном процессе.
 
@@ -58,22 +60,32 @@ def worker(  # type: ignore[reportInvalidTypeForm]
         duration: Длительность в секундах.
         initial_messages: Начальные сообщения для long context (из датасета).
         skip_errors: Если True — продолжать после ошибки.
+        long_context: Если True — воркер работает с длинным контекстом:
+            при новом раунде контекст сбрасывается к сообщениям датасета
+            (а не к голому system), история датасета не обрезается.
+        model_timeout: Таймаут запроса к модели в секундах (read-таймаут
+            httpx: ожидание первого чанка и паузы между чанками).
+            0 или отрицательное значение -- без таймаута (ждать бесконечно,
+            нужно для очень медленных серверов с долгим prefill).
     """
     try:
-        client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=600.0)
+        timeout = model_timeout if model_timeout and model_timeout > 0 else None
+        client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=timeout)
         session = StreamSession(client)
 
-        is_long_context = initial_messages is not None and len(initial_messages) > 1
+        is_long_context = long_context and initial_messages is not None
 
         if is_long_context:
-            # Long context: используем messages из датасета
-            messages: list[dict] = list(initial_messages)  # type: ignore[arg-type]
-            # Помечаем воркер
+            # Long context: base_messages -- диалог из датасета,
+            # к нему возвращаемся при каждом новом раунде.
+            base_messages: list[dict] = list(initial_messages)  # type: ignore[arg-type]
+            messages: list[dict] = list(base_messages)
             q.put({"type": "start", "id": worker_id, "long_context": True})
         else:
-            messages = [
+            base_messages = [
                 {"role": "system", "content": "Ты полезный помощник. Отвечай подробно и развёрнуто."}
             ]
+            messages = list(base_messages)
             q.put({"type": "start", "id": worker_id, "long_context": False})
 
         start_time = time.time()
@@ -107,7 +119,9 @@ def worker(  # type: ignore[reportInvalidTypeForm]
 
             # Проверка лимита контекста -- новый раунд
             if prompt_tokens + total_gen >= MAX_CONTEXT_TOKENS:
-                messages = [{"role": "system", "content": "Ты полезный помощник. Отвечай подробно и развёрнуто."}]
+                # Long context: возвращаемся к диалогу из датасета,
+                # обычный режим: сброс к голому system.
+                messages = list(base_messages)
                 round_num += 1
                 call_count = 0
                 total_gen = 0
@@ -116,7 +130,9 @@ def worker(  # type: ignore[reportInvalidTypeForm]
                 total_ttft = 0.0
                 ttft_count = 0
 
-            if prompt_tokens + total_gen >= _token_limit_warn():
+            # Обрезка истории только в обычном режиме.
+            # В long context история -- сам датасет, её не трогаем.
+            if not is_long_context and prompt_tokens + total_gen >= _token_limit_warn():
                 messages = truncate_history(messages)
 
             messages.append({"role": "user", "content": prompt_text})
@@ -365,6 +381,8 @@ def run_benchmark(
     data_dir=None,
     split="100K",
     skip_errors=False,
+    allow_download=True,
+    model_timeout=None,
 ):
     """Запускает многопроцессный бенчмарк.
 
@@ -380,10 +398,18 @@ def run_benchmark(
         data_dir: Директория с датасетами.
         split: Сплит BEAM датасета ("100K", "500K", "1M").
         skip_errors: Если True — продолжать после ошибки.
+        allow_download: Если False -- не скачивать датасет с HF.
+        model_timeout: Таймаут запроса к модели в секундах (0 -- без
+            таймаута). None -- из env MULTI_MODEL_TIMEOUT или 600.
     """
     apply_config(base_url=base_url, api_key=api_key, model=model, max_context=max_context)
 
     import llm_speed_benchmark.utils as _u  # noqa: PLC0414
+
+    # Таймаут запроса к модели: CLI > env MULTI_MODEL_TIMEOUT > 600
+    if model_timeout is None:
+        model_timeout = float(os.environ.get("MULTI_MODEL_TIMEOUT", "600"))
+    timeout_label = "без таймаута" if model_timeout <= 0 else f"{model_timeout:.0f}s"
 
     # Проверяем реальный контекст модели через API
     if long_context_workers > 0:
@@ -392,22 +418,28 @@ def run_benchmark(
             actual_context = _u.detect_model_context_length(_detect_client, _u.MODEL)
             if actual_context < _u.MAX_CONTEXT_TOKENS:
                 print()
-                print(f"   ОШИБКА: модель {_u.MODEL} поддерживает контекст {actual_context:,} токенов,")
-                print(f"   а в настройках указано MAX_CONTEXT_TOKENS={_u.MAX_CONTEXT_TOKENS:,}.")
-                print(f"   Уменьшите MAX_CONTEXT_TOKENS в .env или передайте --max-context {actual_context}.")
-                print()
-                sys.exit(1)
+                print(f"   Long context: модель {_u.MODEL} поддерживает контекст "
+                      f"{actual_context:,} токенов, а в настройках MAX_CONTEXT_TOKENS="
+                      f"{_u.MAX_CONTEXT_TOKENS:,}.")
+                print(f"   Ограничиваю MAX_CONTEXT_TOKENS до {actual_context} "
+                      f"(для переопределения вручную: --max-context {actual_context}).")
+                _u.MAX_CONTEXT_TOKENS = actual_context
+                _u.TOKEN_LIMIT_WARN = _u._token_limit_warn()
+            else:
+                print(f"   Long context: контекст модели {_u.MODEL} = "
+                      f"{actual_context:,} токенов.")
         except Exception as e:
             print(f"   Warning: не удалось определить контекст модели: {e}")
 
-    # Подготовка long context данных
+    # Подготовка long context данных (с авто-скачиванием с HuggingFace)
     long_context_messages = []
     if long_context_workers > 0:
         try:
-            from .long_context import LongContextDataset
+            from .long_context import LongContextDataset, ensure_beam_data
             ds_data_dir = data_dir or os.path.expanduser(
                 "~/workspace/data/llm-speed-benchmark/datasets"
             )
+            ensure_beam_data(ds_data_dir, split, allow_download=allow_download)
             ds = LongContextDataset(data_dir=ds_data_dir)
             ds.load(split=split)
             for i in range(long_context_workers):
@@ -417,10 +449,14 @@ def run_benchmark(
                     max_tokens=_u.MAX_CONTEXT_TOKENS - 1000,
                 )
                 long_context_messages.append(msgs)
-            console = Console()
-            console.print(
-                f"   [cyan]Long context:[/] {long_context_workers} воркер(ов) "
-                f"из split={split}"
+            ds_data_path = os.path.join(ds_data_dir, "beam", "data")
+            print(
+                f"   Long context: {long_context_workers} воркер(ов) из split={split}",
+                flush=True,
+            )
+            print(
+                f"   Данные для long context взяты из датасета: {ds_data_path}",
+                flush=True,
             )
         except Exception as e:
             print(f"   Warning: не удалось загрузить long context: {e}")
@@ -432,6 +468,7 @@ def run_benchmark(
     print(f"   Модель: {_u.MODEL}")
     print(f"   Ширина Response: {response_width} символов")
     print(f"   Макс контекст: {_u.MAX_CONTEXT_TOKENS:,}")
+    print(f"   Таймаут запроса: {timeout_label}")
     print()
 
     q = Queue()
@@ -456,7 +493,7 @@ def run_benchmark(
         initial_msgs = long_context_messages[i] if is_lc else None
         p = Process(
             target=worker,
-            args=(i, q, start_event, duration, initial_msgs, skip_errors),
+            args=(i, q, start_event, duration, initial_msgs, skip_errors, is_lc, model_timeout),
             name=f"worker-{i}",
         )
         p.start()
@@ -591,6 +628,15 @@ def cli():
         "--skip-errors", action="store_true", default=False,
         help="Продолжать после ошибки (по умолчанию воркер останавливается)",
     )
+    parser.add_argument(
+        "--no-download", action="store_true", default=False,
+        help="Не скачивать датасет BEAM с HuggingFace (только локальные данные)",
+    )
+    parser.add_argument(
+        "--model-timeout", type=float, default=None,
+        help="Таймаут запроса к модели в секундах (0 -- без таймаута; "
+             "по умолч. env MULTI_MODEL_TIMEOUT или 600)",
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -605,6 +651,8 @@ def cli():
         data_dir=args.data_dir,
         split=args.split,
         skip_errors=args.skip_errors,
+        allow_download=not args.no_download,
+        model_timeout=args.model_timeout,
     )
 
 

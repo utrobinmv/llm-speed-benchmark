@@ -3,8 +3,10 @@ llm_speed_benchmark/long_context.py
 
 Загрузка и подготовка датасетов длинных контекстов для бенчмарка.
 
-Датасеты хранятся в ~/workspace/data/llm-speed-benchmark/datasets/
-и должны быть скачаны заранее (см. DATA.md).
+Датасеты хранятся в ~/workspace/data/llm-speed-benchmark/datasets/.
+Если данных нет -- скачиваются автоматически с HuggingFace
+(Mohammadta/BEAM, public) через ensure_beam_data(). Ручное скачивание
+не требуется (см. DATA.md).
 
 Поддерживаемые датасеты:
 - BEAM (Mohammadta/BEAM) -- multi-turn conversations 128K-2.4M токенов
@@ -24,7 +26,11 @@ llm_speed_benchmark/long_context.py
 
 from __future__ import annotations
 
+import json
 import os
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -42,6 +48,110 @@ BEAM_SPLITS = {
     "500K": "500K-*.parquet",
     "1M": "1M-*.parquet",
 }
+
+# HuggingFace-источник BEAM (public, gated=false)
+BEAM_HF_REPO = "Mohammadta/BEAM"
+BEAM_HF_API = f"https://huggingface.co/api/datasets/{BEAM_HF_REPO}"
+BEAM_HF_RESOLVE = f"https://huggingface.co/datasets/{BEAM_HF_REPO}/resolve/main"
+_HF_USER_AGENT = "llm-speed-benchmark"
+
+
+def _hf_list_files(subpath: str = "data") -> list[str]:
+    """Список файлов в директории датасета через HF API (без токена)."""
+    url = f"{BEAM_HF_API}/tree/main/{subpath}"
+    req = urllib.request.Request(url, headers={"User-Agent": _HF_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read())
+    return [f["path"] for f in data if f.get("type") == "file"]
+
+
+def _download_file(url: str, dest: Path, retries: int = 3, timeout: int = 120) -> None:
+    """Скачивает файл с докачкой (Range) и ретраями.
+
+    Промежуточный .part-файл позволяет продолжить после обрыва сети.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+    last_err: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        existing = part.stat().st_size if part.exists() else 0
+        try:
+            headers = {"User-Agent": _HF_USER_AGENT}
+            if existing > 0:
+                headers["Range"] = f"bytes={existing}-"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                status = r.status
+                # 200 = полный файл (начать заново), 206 = partial (докачка)
+                if status == 200:
+                    existing = 0
+                mode = "ab" if (status == 206 and existing > 0) else "wb"
+                with open(part, mode) as f:
+                    while True:
+                        chunk = r.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            part.rename(dest)
+            return
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            print(f"   Скачивание {url.split('/')[-1]} (попытка {attempt}/{retries}): {e}", flush=True)
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"Не удалось скачать {url}: {last_err}")
+
+
+def ensure_beam_data(data_dir: str, split: str, allow_download: bool = True) -> Path:
+    """Гарантирует наличие parquet для split, скачивая с HF при отсутствии.
+
+    Args:
+        data_dir: Корень директории с датасетами (содержит beam/).
+        split: Сплит BEAM ("100K", "500K", "1M").
+        allow_download: Если False -- не скачивать, только проверять.
+
+    Returns:
+        Путь к data/ директории BEAM.
+
+    Raises:
+        ValueError: неизвестный split.
+        FileNotFoundError: данные отсутствуют и allow_download=False.
+        RuntimeError: скачивание не удалось.
+    """
+    if split not in BEAM_SPLITS:
+        raise ValueError(
+            f"Неизвестный split '{split}'. Доступные: {', '.join(sorted(BEAM_SPLITS))}"
+        )
+    data_path = Path(data_dir) / "beam" / "data"
+    pattern = BEAM_SPLITS[split]
+    existing = sorted(data_path.glob(pattern)) if data_path.exists() else []
+    if existing:
+        return data_path
+
+    if not allow_download:
+        raise FileNotFoundError(
+            f"Датасет BEAM не найден: {data_path}/{pattern}\n"
+            f"Скачайте заранее: hf download --repo-type dataset {BEAM_HF_REPO} "
+            f"--local-dir {data_path.parent}"
+        )
+
+    # Определяем точное имя файла в HF (фолбэк на известное имя)
+    rel = f"data/{split}-00000-of-00001.parquet"
+    try:
+        files = _hf_list_files("data")
+        match = [f for f in files if f.split("/")[-1].startswith(split + "-")]
+        if match:
+            rel = match[0]
+    except Exception as e:  # noqa: BLE001
+        print(f"   Warning: не удалось получить список файлов HF ({e}), "
+              f"использую {rel}", flush=True)
+
+    url = f"{BEAM_HF_RESOLVE}/{rel}"
+    dest = data_path / rel.split("/")[-1]
+    size_hint = {"100K": "~5 МБ", "500K": "~34 МБ", "1M": "~66 МБ"}.get(split, "")
+    print(f"   Long context: датасет не найден, скачиваю BEAM split={split} {size_hint}...", flush=True)
+    _download_file(url, dest)
+    print(f"   Сохранено: {dest}", flush=True)
+    return data_path
 
 
 @dataclass

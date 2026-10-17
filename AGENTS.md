@@ -6,7 +6,7 @@
 
 Семь режимов:
 - `bench_single` — последовательные вызовы, накопление контекста, статистика
-- `bench_multi` — N параллельных процессов (multiprocessing), Rich Live-таблица
+- `bench_multi` — N параллельных процессов (multiprocessing), Rich Live-таблица, long context из BEAM
 - `bench_vision` — бенчмарк мультимодальной модели: изображения, видео или И то и другое в одном запросе
 - `bench_audio` — бенчмарк аудио-модели: отправляет аудио файлы через chat.completions, измеряет TTFT и скорость
 - `bench_transcription` — бенчмарк ASR-моделей (Whisper, Qwen-ASR): endpoint audio.transcriptions, RTF, токены/сек
@@ -33,7 +33,7 @@ llm-speed-benchmark/
 ├── src/llm_speed_benchmark/         # ИСХОДНЫЙ КОД ПАКЕТА
 │   ├── __init__.py                  # __version__
 │   ├── bench_single.py              # Одиночный воркер + cli()
-│   ├── bench_multi.py               # Многопроцессный + LiveTable + cli()
+│   ├── bench_multi.py               # Многопроцессный + LiveTable + cli() + long context
 │   ├── bench_vision.py              # Vision/Video/Mixed бенчмарк + cli()
 │   ├── bench_audio.py               # Audio-бенчмарк (chat.completions) + cli()
 │   ├── bench_transcription.py       # ASR-бенчмарк (audio.transcriptions) + cli()
@@ -79,6 +79,38 @@ bench_transcription = "llm_speed_benchmark.bench_transcription:cli"
 bench_tts = "llm_speed_benchmark.bench_tts:cli"
 bench_emb = "llm_speed_benchmark.bench_emb:cli"
 ```
+
+## bench_multi — long context (BEAM)
+
+`--long-context-workers N` запускает N воркеров с длинным контекстом из
+датасета BEAM (multi-turn диалоги 100K-2.4M токенов).
+
+**Авто-скачивание.** Если `~/workspace/data/llm-speed-benchmark/datasets/beam/`
+пусто — `ensure_beam_data()` (в `long_context.py`) скачивает нужный split с
+HuggingFace (`Mohammadta/BEAM`, public) через `urllib` с докачкой (Range) и
+ретраями. Без `huggingface_hub` — только stdlib. Отключается `--no-download`.
+
+**Порядок в `run_benchmark()`:**
+1. `detect_model_context_length()` — реальный контекст модели через
+   `models.retrieve` → `max_model_len`. Если меньше `MAX_CONTEXT_TOKENS` —
+   лимит ограничивается до реального (clamp, без `sys.exit`).
+2. `ensure_beam_data()` — скачивание при отсутствии.
+3. `LongContextDataset.get_messages(max_tokens=MAX_CONTEXT_TOKENS-1000)` —
+   диалог, обрезанный до лимита.
+
+**Воркер (`worker()`):** параметр `long_context: bool`. При новом раунде
+(лимит контекста) контекст сбрасывается к `base_messages` (диалог датасета),
+а не к голому system. `truncate_history()` в long context НЕ вызывается —
+история датасета не обрезается.
+
+**Колонки/маркеры:** воркер с long context помечается `[LC]` в колонке ID.
+
+**Таймаут запроса.** `worker()` создаёт OpenAI-клиент с `timeout=model_timeout`
+(read-таймаут httpx: ожидание первого чанка во время prefill + паузы между
+чанками). Приоритет: CLI `--model-timeout` > env `MULTI_MODEL_TIMEOUT` > 600.
+`model_timeout=0` (или отрицательное) → `timeout=None` → ждать бесконечно.
+Критично для медленных серверов: prefill 100K токенов при ~12 tok/s ≈ 2.3 часа,
+стандартные 600с не выдержат — нужен `--model-timeout 0`.
 
 ## bench_vision — три режима работы
 
@@ -144,10 +176,16 @@ EMB_BASE_URL=http://192.168.45.10:30004/v1
 EMB_API_KEY=any_key
 EMB_MODEL=/mnt/extendet_data/models_emb/embeddinggemma-300m
 EMB_MODEL_TIMEOUT=600
-EMB_MAX_MODEL_LEN=2048
+
+# bench_multi: таймаут запроса к модели (сек; 0 = без таймаута)
+# Нужен для медленных серверов с долгим prefill длинных промптов
+MULTI_MODEL_TIMEOUT=600
 ```
 
 Загрузка: `utils.py` → `load_dotenv()` из cwd + `~/.llm-speed-benchmark.env`.
+Полный список переменных с комментариями — в `.env.example`
+(`cp .env.example .env`). `EMB_MAX_MODEL_LEN` в коде НЕ читается —
+не использовать.
 
 **Приоритет конфигурации:** CLI аргументы > `TRANSCRIPTION_*`/`TTS_*`/`EMB_*` из `.env` > базовые `BASE_URL`/`API_KEY`/`MODEL` из `.env`
 
@@ -167,6 +205,13 @@ bench_multi                                           # 4 воркера, до C
 bench_multi -w 8 -d 60                                # 8 воркеров, 60 сек
 bench_multi --response-width 120                      # Широкая колонка
 bench_multi --max-context 32768                       # Переопределение лимита
+
+# bench_multi — long context (BEAM)
+bench_multi -w 4 --long-context-workers 1              # 1 воркер с длинным контекстом
+bench_multi --long-context-workers 2 -d 120            # 2 LC-воркера, 120 сек
+bench_multi --long-context-workers 1 --split 500K      # split 500K
+bench_multi --long-context-workers 1 --no-download     # только локальные данные
+bench_multi --long-context-workers 1 --model-timeout 0 # медленный сервер: без таймаута
 
 # bench_vision — три режима
 bench_vision                                            # 4 воркера, image-only (авто-генерация)
@@ -220,7 +265,7 @@ bench_emb --mode once                                   # один проход
 --max-context     Переопределение MAX_CONTEXT_TOKENS
 ```
 
-## Kiểm tra
+## Проверка
 ```bash
 pytest
 ```

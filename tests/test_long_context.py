@@ -19,6 +19,7 @@ from llm_speed_benchmark.long_context import (
     ConversationInfo,
     LongContextDataset,
     _DEFAULT_DATA_DIR,
+    ensure_beam_data,
 )
 
 
@@ -154,6 +155,62 @@ class TestLoadBeam:
         Path(tmp_data_dir, "unknown").mkdir(parents=True)
         with pytest.raises(ValueError, match="Неизвестный датасет"):
             ds.load()
+
+
+class TestEnsureBeamData:
+    """ensure_beam_data: авто-скачивание BEAM с HuggingFace."""
+
+    def test_existing_data_no_download(self, tmp_data_dir: str) -> None:
+        """Данные уже есть -- скачивание не инициируется."""
+        beam_dir = Path(tmp_data_dir) / "beam" / "data"
+        beam_dir.mkdir(parents=True)
+        (beam_dir / "100K-00000-of-00001.parquet").touch()
+        with patch("llm_speed_benchmark.long_context._download_file") as mock_dl:
+            result = ensure_beam_data(tmp_data_dir, "100K")
+        mock_dl.assert_not_called()
+        assert result == beam_dir
+
+    def test_missing_data_downloads(self, tmp_data_dir: str) -> None:
+        """Данных нет -- скачивается с HF, файл появляется."""
+        with patch("llm_speed_benchmark.long_context._hf_list_files",
+                   return_value=["data/100K-00000-of-00001.parquet"]), \
+             patch("llm_speed_benchmark.long_context._download_file") as mock_dl:
+            result = ensure_beam_data(tmp_data_dir, "100K")
+        mock_dl.assert_called_once()
+        args, _ = mock_dl.call_args
+        assert args[0].endswith("data/100K-00000-of-00001.parquet")
+        # dest -- внутри beam/data/
+        assert args[1] == Path(tmp_data_dir) / "beam" / "data" / "100K-00000-of-00001.parquet"
+        assert result == Path(tmp_data_dir) / "beam" / "data"
+
+    def test_missing_data_no_download_raises(self, tmp_data_dir: str) -> None:
+        """Данных нет и allow_download=False -- FileNotFoundError."""
+        with patch("llm_speed_benchmark.long_context._download_file") as mock_dl:
+            with pytest.raises(FileNotFoundError, match="не найден"):
+                ensure_beam_data(tmp_data_dir, "100K", allow_download=False)
+        mock_dl.assert_not_called()
+
+    def test_unknown_split_raises(self, tmp_data_dir: str) -> None:
+        with pytest.raises(ValueError, match="Неизвестный split"):
+            ensure_beam_data(tmp_data_dir, "999K")
+
+    def test_download_fallback_filename_on_api_error(self, tmp_data_dir: str) -> None:
+        """HF API недоступен -- используется известное имя файла."""
+        with patch("llm_speed_benchmark.long_context._hf_list_files",
+                   side_effect=RuntimeError("network down")), \
+             patch("llm_speed_benchmark.long_context._download_file") as mock_dl:
+            ensure_beam_data(tmp_data_dir, "500K")
+        args, _ = mock_dl.call_args
+        assert args[0].endswith("data/500K-00000-of-00001.parquet")
+
+    def test_download_runtime_error_propagates(self, tmp_data_dir: str) -> None:
+        """Скачивание не удалось -- RuntimeError пробрасывается."""
+        with patch("llm_speed_benchmark.long_context._hf_list_files",
+                   return_value=["data/1M-00000-of-00001.parquet"]), \
+             patch("llm_speed_benchmark.long_context._download_file",
+                   side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                ensure_beam_data(tmp_data_dir, "1M")
 
 
 class TestFlattenChat:
