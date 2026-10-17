@@ -8,6 +8,7 @@ Shared functionality:
 
 from __future__ import annotations
 
+import logging
 import time
 from threading import Lock, Thread
 from typing import Any, Callable, Optional
@@ -45,25 +46,36 @@ def make_time_sender(
 
     def _send() -> None:
         while True:
-            if duration is not None:
-                elapsed = time.time() - start_time
-                if elapsed >= duration:
-                    break
-            time.sleep(1)
-            wall = time.time() - start_time
-            msg: dict[str, Any] = {
-                "type": "time",
-                "id": worker_id,
-                "wall": format_time(wall),
-            }
-            if state is not None and state_lock is not None and wall > 0:
-                with state_lock:
-                    tg = state["total_gen"]
-                    cc = state["chunk_count"]
-                est_gen = tg + cc
-                avg_sp = round(est_gen / wall, 1) if wall > 0 else 0
-                msg["avg"] = avg_sp
-            q.put(msg)
+            try:
+                if duration is not None:
+                    elapsed = time.time() - start_time
+                    if elapsed >= duration:
+                        break
+                time.sleep(1)
+                wall = time.time() - start_time
+                msg: dict[str, Any] = {
+                    "type": "time",
+                    "id": worker_id,
+                    "wall": format_time(wall),
+                }
+                if state is not None and state_lock is not None and wall > 0:
+                    with state_lock:
+                        # .get() вместо [] — не падаем на KeyError, если
+                        # state не содержит эти ключи.
+                        tg = state.get("total_gen", 0)
+                        cc = state.get("chunk_count", 0)
+                    est_gen = tg + cc
+                    avg_sp = round(est_gen / wall, 1) if wall > 0 else 0
+                    msg["avg"] = avg_sp
+                q.put(msg)
+            except Exception:  # noqa: BLE001
+                # Daemon-thread: единичный сбой не должен молча убивать
+                # поток обновления wall-time (иначе — тихая утрата
+                # live-обновлений). Логируем и продолжаем в следующем цикле.
+                logging.getLogger(__name__).exception(
+                    "time-sender thread error (worker %s)", worker_id
+                )
+                time.sleep(1)
 
     t = Thread(target=_send, daemon=True)
     t.start()

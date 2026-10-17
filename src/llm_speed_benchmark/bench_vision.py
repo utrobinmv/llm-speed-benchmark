@@ -34,6 +34,7 @@ import signal
 import argparse
 import traceback
 from multiprocessing import Process, Queue, Event
+from queue import Empty as QueueEmpty
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -163,6 +164,19 @@ def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
             _get_media_name,
             media_count_ref=media_count_ref,
         )
+
+        # Обёртка: во время активного вызова увеличиваем in-flight counter
+        # в _state для time-sender'а (live avg должен учитывать и текущий
+        # незавершённый call, а не только завершённые). При каждом успешном
+        # вызове (ниже) счётчик снова сбрасывается в 0.
+        _base_on_chunk = _on_chunk
+
+        def _on_chunk_with_state(*args, **kwargs):  # type: ignore[no-untyped-def]
+            with _state_lock:
+                _state["chunk_count"] = _state.get("chunk_count", 0) + 1
+            return _base_on_chunk(*args, **kwargs)
+
+        _on_chunk = _on_chunk_with_state
 
         start_event.wait()
 
@@ -707,15 +721,13 @@ def run_benchmark(
             if stop_requested:
                 break
 
-            # Проверка duration
-            if duration is not None:
-                alive = any(p.is_alive() for p in processes)
-                if not alive:
-                    break
+            # Останавливаемся, когда все воркеры вышли (независимо от duration).
+            if not any(p.is_alive() for p in processes):
+                break
 
             try:
                 msg = q.get(timeout=0.5)
-            except Exception:
+            except QueueEmpty:
                 msg = None
 
             if msg is None:

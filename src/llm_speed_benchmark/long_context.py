@@ -56,6 +56,41 @@ BEAM_HF_RESOLVE = f"https://huggingface.co/datasets/{BEAM_HF_REPO}/resolve/main"
 _HF_USER_AGENT = "llm-speed-benchmark"
 
 
+def _normalize_content(content) -> str:
+    """Приводит содержимое сообщения к плоской строке.
+
+    BEAM-чаты могут быть мультимодальными: content -- это список партов
+    (dict с text/image_url и т.п.), словарь или None. Для подсчёта токенов
+    и построения сообщений нужна строка, поэтому:
+    - None -> ""
+    - список/кортеж -> конкатенация текстовых частей (text, а для прочих частей метка)
+    - dict -> значение из ключей text/content или str(dict)
+    - иначе -> str(value)
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                if "text" in part:
+                    parts.append(str(part["text"]))
+                elif "content" in part:
+                    parts.append(_normalize_content(part["content"]))
+                else:
+                    parts.append(str(part))
+            elif part is not None:
+                parts.append(str(part))
+        return "\n".join(p for p in parts if p)
+    if isinstance(content, dict):
+        return _normalize_content(content.get("text") or content.get("content") or str(content))
+    return str(content)
+
+
 def _hf_list_files(subpath: str = "data") -> list[str]:
     """Список файлов в директории датасета через HF API (без токена)."""
     url = f"{BEAM_HF_API}/tree/main/{subpath}"
@@ -82,16 +117,32 @@ def _download_file(url: str, dest: Path, retries: int = 3, timeout: int = 120) -
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 status = r.status
+                content_length = r.headers.get("Content-Length")
+                expected = int(content_length) if content_length else None
                 # 200 = полный файл (начать заново), 206 = partial (докачка)
                 if status == 200:
                     existing = 0
                 mode = "ab" if (status == 206 and existing > 0) else "wb"
+                written = 0
                 with open(part, mode) as f:
                     while True:
                         chunk = r.read(256 * 1024)
                         if not chunk:
                             break
                         f.write(chunk)
+                        written += len(chunk)
+                # Если отдано меньше обещанного Content-Length (чистый EOF,
+                # без исключения) — файл битый: НЕ переименовываем, оставляем
+                # .part, чтобы следующий attempt докачал с правильной позиции.
+                if expected is not None and written < expected - existing:
+                    raise OSError(
+                        f"Truncated download: {written + existing} of {expected} bytes"
+                    )
+                if expected is not None and (written + existing) > expected:
+                    raise OSError(
+                        f"Download larger than Content-Length: "
+                        f"{written + existing} vs {expected} bytes"
+                    )
             part.rename(dest)
             return
         except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -192,8 +243,14 @@ class LongContextDataset:
 
     @property
     def is_available(self) -> bool:
-        """Проверяет, есть ли данные на диске."""
-        return self.dataset_path.exists()
+        """Проверяет, есть ли данные на диске (реальные parquet-файлы)."""
+        if not self.dataset_path.exists():
+            return False
+        # Каталог может существовать, но без parquet — это не «доступно».
+        try:
+            return any(self.beam_data_path.glob("*.parquet"))
+        except OSError:
+            return False
 
     def load(self, split: str = "100K") -> list[dict]:
         """Загружает данные из локальной директории.
@@ -211,18 +268,18 @@ class LongContextDataset:
         if self._conversations is not None and self._split == split:
             return self._conversations
 
+        if self.dataset_name != "beam":
+            raise ValueError(
+                f"Неизвестный датасет: {self.dataset_name}. Доступные: beam"
+            )
+
         if not self.is_available:
             raise FileNotFoundError(
                 f"Датасет {self.dataset_name} не найден: {self.dataset_path}\n"
                 f"Скачайте заранее: hf download --repo-type dataset Mohammadta/BEAM --local-dir {self.dataset_path}"
             )
 
-        if self.dataset_name == "beam":
-            self._conversations = self._load_beam(split)
-        else:
-            raise ValueError(
-                f"Неизвестный датасет: {self.dataset_name}. Доступные: beam"
-            )
+        self._conversations = self._load_beam(split)
 
         self._split = split
         self._build_info()
@@ -294,11 +351,17 @@ class LongContextDataset:
         result: list[dict] = []
         for group in chat_array:
             for entry in group:
-                if isinstance(entry, dict):
-                    result.append({
-                        "role": entry.get("role", "user"),
-                        "content": entry.get("content", ""),
-                    })
+                if not isinstance(entry, dict):
+                    continue
+                content = entry.get("content", "")
+                # Нормализуем контент в строку: BEAM-чаты могут быть
+                # мультимодальными (content = список партов) или None —
+                # иначе len()/токен-оценки ниже упадут на TypeError.
+                content = _normalize_content(content)
+                result.append({
+                    "role": entry.get("role", "user"),
+                    "content": content,
+                })
         return result
 
     def get_conversations_info(self) -> list[ConversationInfo]:
@@ -350,7 +413,12 @@ class LongContextDataset:
         Raises:
             IndexError: если conversation_id вне диапазона.
         """
-        data = self.load()
+        if self._conversations is not None and self._split:
+            # Уже загружен какой-то split — используем его, НЕ перезагружая
+            # дефолтный "100K" (иначе индексация conversation_id съедет).
+            data = self._conversations
+        else:
+            data = self.load()
         if conversation_id < 0 or conversation_id >= len(data):
             raise IndexError(
                 f"conversation_id={conversation_id} вне диапазона "
@@ -376,16 +444,15 @@ class LongContextDataset:
         ]
         messages.extend(flat_msgs)
 
-        # Обрезка до max_tokens -- удаляем самые старые (после system)
+        # Обрезка до max_tokens -- удаляем самые старые (после system).
+        # total_est декрементируется на оценку выкинутого сообщения
+        # вместо пересчёта всей суммы (иначе O(n^2) на больших контекстах).
         total_est = sum(
             self._estimate_text_tokens(m.get("content", "")) for m in messages
         )
         while total_est > max_tokens and len(messages) > 2:
-            messages.pop(1)  # Удаляем после system
-            total_est = sum(
-                self._estimate_text_tokens(m.get("content", ""))
-                for m in messages
-            )
+            removed = messages.pop(1)  # Удаляем после system
+            total_est -= self._estimate_text_tokens(removed.get("content", ""))
 
         return messages
 

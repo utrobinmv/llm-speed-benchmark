@@ -83,6 +83,9 @@ class StreamSession:
         Returns:
             StreamMetrics с результатами вызова.
         """
+        # Отсчёт от начала ВСЕГО вызова (включая клиентскую подготовку,
+        # сеть и очередь сервера). TTFT/elapsed — это wall-clock от начала
+        # вызова, а не чистого времени генерации модели.
         turn_start = time.time()
 
         response = self.client.chat.completions.create(
@@ -128,6 +131,11 @@ class StreamSession:
                         if first_token_time is None:
                             first_token_time = now_chunk
                         instant_buffer.append((now_chunk, chunk_count))
+                        # _instant_speed читает только последние ~6 записей;
+                        # обрезаем буфер, чтобы он не рос бесконечно на
+                        # длинных генерациях.
+                        if len(instant_buffer) > 8:
+                            del instant_buffer[:-6]
 
                         # Live callback (throttle 0.5s)
                         if self.on_chunk and (now_chunk - last_chunk_send >= 0.5):
@@ -148,6 +156,27 @@ class StreamSession:
                                 wall_elapsed,
                             )
                             last_chunk_send = now_chunk
+
+        # Финальный on_chunk: для быстрых ответов (< 0.5s) во время цикла
+        # callback ни разу не сработал из-за троттлинга — сообщаем финальные
+        # значения, чтобы потребители live-прогресса всегда получили данные.
+        if self.on_chunk and chunk_count > 0 and last_chunk_send == 0.0:
+            inst_sp_final = self._instant_speed(instant_buffer)
+            ttft_final = (
+                round((first_token_time or turn_start) - turn_start, 2)
+                if first_token_time is not None
+                else None
+            )
+            wall_final = time.time() - self.on_chunk_args.get(
+                "start_time", turn_start
+            )
+            self.on_chunk(
+                chunk_count,
+                inst_sp_final,
+                ttft_final,
+                assistant_content[-100:],
+                wall_final,
+            )
 
         elapsed = time.time() - turn_start
 

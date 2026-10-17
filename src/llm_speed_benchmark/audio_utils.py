@@ -16,18 +16,6 @@ from typing import List, Sequence, Tuple
 _ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets" / "audio"
 
 # Фразы, записанные в тестовые аудиофайлы (для справки)
-TEST_PHRASES = [
-    "Привет, как дела? Надеюсь, у тебя всё хорошо.",
-    "Сегодня прекрасная погода для прогулки в парке.",
-    "Я люблю читать книги перед сном, особенно фантастику.",
-    "Завтра утром нужно купить хлеб и молоко в магазине.",
-    "Кот сидел на окне и наблюдал за птицами во дворе.",
-    "Машина остановилась у светофора, ожидая зелёного сигнала.",
-    "Дети играли во дворе, смеясь и бегая за мячом.",
-    "На столе лежали яблоки, груши и виноград из сада.",
-    "Поезд отправляется с платформы три в девять часов вечера.",
-    "Мы планируем поездку на море в следующем месяце.",
-]
 
 DEFAULT_AUDIO_PROMPTS = [
     "Транскрибируй это аудио.",
@@ -80,12 +68,18 @@ def load_audio_as_base64(audio_path: str | Path) -> Tuple[str, str]:
         Кортеж (format, base64_string).
     """
     suffix = Path(audio_path).suffix.lower()
-    # OpenAI поддерживает только wav и mp3
+    # OpenAI поддерживает только wav и mp3; неизвестный формат отклоняем,
+    # а не молча маркируем как "wav" (иначе API получает неверный MIME).
     format_map = {
         ".wav": "wav",
         ".mp3": "mp3",
     }
-    fmt = format_map.get(suffix, "wav")
+    if suffix not in format_map:
+        raise ValueError(
+            f"Неподдерживаемый формат аудио '{suffix or '<без расширения>'}': {audio_path}. "
+            "Поддерживаются только .wav и .mp3."
+        )
+    fmt = format_map[suffix]
 
     with open(audio_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("ascii")
@@ -106,7 +100,12 @@ def build_audio_message(
 
     Returns:
         Список сообщений в формате vLLM chat API.
+
+    Raises:
+        ValueError: если audio_paths пуст.
     """
+    if not audio_paths:
+        raise ValueError("build_audio_message: список аудиофайлов пуст")
     content_parts: list = [{"type": "text", "text": prompt}]
     for audio_path in audio_paths:
         fmt, b64 = load_audio_as_base64(audio_path)

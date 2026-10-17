@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
+from queue import Empty as QueueEmpty
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table, box as _rich_box
@@ -267,6 +268,11 @@ def _worker(  # type: ignore[valid-type]
     total_proc_ref: list[float] = [0.0]
     total_ttft_ref: list[float] = [0.0]
 
+    # Lock для live-статистики: время-sender (daemon-thread) читает эти
+    # рефы/счётчики параллельно с записью в основном цикле воркера —
+    # защищаем от гонки (torn read).
+    _live_lock = __import__("threading").Lock()
+
     # Time-sender thread
     def _send_time() -> None:
         while True:
@@ -281,9 +287,13 @@ def _worker(  # type: ignore[valid-type]
                 "id": worker_id,
                 "wall": format_time(wall),
             }
-            if total_proc_ref[0] > 0:
-                msg["avg_proc"] = round(total_proc_ref[0] / call_count, 3) if call_count > 0 else 0
-                msg["avg_chars"] = round(total_chars_ref[0] / wall, 1) if wall > 0 else 0
+            with _live_lock:
+                _proc = total_proc_ref[0]
+                _calls = call_count
+                _chars = total_chars_ref[0]
+            if _proc > 0:
+                msg["avg_proc"] = round(_proc / _calls, 3) if _calls > 0 else 0
+                msg["avg_chars"] = round(_chars / wall, 1) if wall > 0 else 0
             q.put(msg)
 
     time_thread = __import__("threading").Thread(target=_send_time, daemon=True)
@@ -328,13 +338,23 @@ def _worker(  # type: ignore[valid-type]
                     response_format=response_format,
                 )
 
-                # Читаем все байты
-                if hasattr(response, "read"):
+                # Читаем все байты и фиксируем время первого байта (честный TTFT).
+                if hasattr(response, "iter_bytes"):
+                    # Потоковый путь: замеряем время первого полученного байта.
+                    first_byte_recorded = False
+                    bufs = []
+                    for chunk in response.iter_bytes():
+                        if not first_byte_recorded:
+                            first_byte_time = time.time() - processing_start
+                            first_byte_recorded = True
+                        bufs.append(chunk)
+                    audio_data = b"".join(bufs)
+                elif hasattr(response, "read"):
+                    # Не-потоковый путь: нет отдельного события первого байта,
+                    # TTFT не определяем (не приравниваем к полному времени).
                     audio_data = response.read()
                 elif hasattr(response, "content"):
                     audio_data = response.content
-                elif hasattr(response, "iter_bytes"):
-                    audio_data = b"".join(response.iter_bytes())
                 else:
                     # stream_to_file или другой метод
                     buf = io.BytesIO()
@@ -343,7 +363,10 @@ def _worker(  # type: ignore[valid-type]
                     audio_data = buf.getvalue()
 
                 processing_time = time.time() - processing_start
-                first_byte_time = processing_time  # non-streaming: all at once
+                if first_byte_time is None and audio_data:
+                    # Измерить первый байт нельзя (не-потоковое чтение);
+                    # оставляем None, чтобы не выдавать полное время за TTFT.
+                    first_byte_time = None
 
             except Exception as exc:  # noqa: BLE001
                 error_msg = str(exc)
@@ -359,7 +382,8 @@ def _worker(  # type: ignore[valid-type]
                 audio_data = b"[error]"
                 processing_time = time.time() - processing_start
 
-            call_count += 1
+            with _live_lock:
+                call_count += 1
             wall_total = time.time() - start_time
 
             total_chars += char_count
@@ -367,12 +391,12 @@ def _worker(  # type: ignore[valid-type]
             total_processing_time += processing_time
             if first_byte_time is not None:
                 total_ttft += first_byte_time
-                ttft_count += 1
 
-            total_chars_ref[0] = total_chars
-            total_size_ref[0] = total_size
-            total_proc_ref[0] = total_processing_time
-            total_ttft_ref[0] = total_ttft
+            with _live_lock:
+                total_chars_ref[0] = total_chars
+                total_size_ref[0] = total_size
+                total_proc_ref[0] = total_processing_time
+                total_ttft_ref[0] = total_ttft
 
             # Метрики
             avg_proc = total_processing_time / call_count if call_count > 0 else 0
@@ -658,14 +682,17 @@ def run_benchmark(
             if stop_requested:
                 break
 
-            if duration is not None and mode == "cycling":
-                alive = any(p.is_alive() for p in processes)
-                if not alive:
+            # В режиме "cycling" останов по duration / завершению воркеров.
+            # В режиме "once" всегда останавливаемся, когда все воркеры вышли.
+            if mode == "cycling":
+                if duration is not None and not any(p.is_alive() for p in processes):
                     break
+            elif not any(p.is_alive() for p in processes):
+                break
 
             try:
                 msg = q.get(timeout=0.5)
-            except Exception:
+            except QueueEmpty:
                 msg = None
 
             if msg is None:

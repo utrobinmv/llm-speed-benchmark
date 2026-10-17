@@ -118,29 +118,44 @@ def generate_audio_at_duration(
         raise FileNotFoundError("No bundled audio files found")
 
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = _CACHE_DIR / f"audio_{int(target_duration * 100)}s.wav"
+    # Ключ кэша включает параметры формата, чтобы перегенерация происходила
+    # при изменении sample_rate / channels / sampwidth.
+    cache_file = _CACHE_DIR / (
+        f"audio_{int(target_duration * 100)}s_"
+        f"{sample_rate}_{channels}_{sampwidth}.wav"
+    )
 
     if cache_file.exists():
         return cache_file
 
-    # Считываем все бандл-аудио и циклически повторяем до нужной длины
-    total_samples = int(target_duration * sample_rate)
-
-    # Собираем raw frames из бандла
+    # Считываем все бандл-аудио и циклически повторяем до нужной длины.
+    # Все WAV-источники валидируются на ЕДИНЫЙ формат между собой, чтобы
+    # конкатенация raw-фреймов была корректной. Совпадение с целевыми
+    # параметрами вывода не требуется: на выходе файл пересоздаётся
+    # с target sample_rate/channels/sampwidth. (При ином sample_rate
+    # у источников pitch/темп сохраняется лишь приблизительно — для
+    # полного ресемплинга нужен внешний декодер.)
     source_frames: List[bytes] = []
-    source_sample_rate = sample_rate
+    source_format: Optional[Tuple[int, int, int]] = None  # (rate, sampwidth, channels)
 
     for audio_path in bundled_audios:
         suffix = audio_path.suffix.lower()
         if suffix == ".wav":
             with wave.open(str(audio_path), "rb") as w:
-                sr = w.getframerate()
-                source_sample_rate = sr  # use last file's rate
+                fmt = (w.getframerate(), w.getsampwidth(), w.getnchannels())
+                if source_format is None:
+                    source_format = fmt
+                elif source_format != fmt:
+                    raise ValueError(
+                        "Bundled audio files are not in a uniform format: "
+                        f"{source_format} vs {fmt}. Нормализуйте источники "
+                        "к одному формату (rate/sampwidth/channels)."
+                    )
                 nframes = w.getnframes()
                 raw = w.readframes(nframes)
                 source_frames.append(raw)
         else:
-            # Для не-WAV просто читаем raw bytes
+            # Для не-WAV просто читаем raw bytes (формат неизвестен — считаем целевым)
             source_frames.append(audio_path.read_bytes())
 
     # Объединяем все бандл-фреймы в один пул
@@ -148,8 +163,16 @@ def generate_audio_at_duration(
     if not pool:
         raise ValueError("No audio data found in bundled files")
 
-    # Рассчитываем длительность пула
-    pool_duration = len(pool) / (sampwidth * sample_rate * channels)
+    # Целевой размер в сэмплах и байтах по целевому формату вывода
+    total_samples = int(target_duration * sample_rate)
+    # Рассчитываем длительность пула по фактическому формату источника
+    # (влияет только на запас повторений; точный размер задаёт total_samples)
+    if source_format is not None:
+        pool_duration = len(pool) / (
+            source_format[1] * source_format[0] * source_format[2]
+        )
+    else:
+        pool_duration = len(pool) / (sampwidth * sample_rate * channels)
     if pool_duration <= 0:
         raise ValueError("Audio pool duration is zero")
 

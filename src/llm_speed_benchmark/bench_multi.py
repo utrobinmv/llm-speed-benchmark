@@ -19,6 +19,7 @@ import argparse
 import traceback
 from datetime import datetime
 from multiprocessing import Process, Queue, Event
+from queue import Empty as QueueEmpty
 
 from openai import OpenAI
 from rich.console import Console
@@ -50,6 +51,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
     skip_errors: bool = False,
     long_context: bool = False,
     model_timeout: float = 600.0,
+    max_context: int | None = None,
 ) -> None:
     """Запускает цикл вызовов LLM в отдельном процессе.
 
@@ -67,7 +69,13 @@ def worker(  # type: ignore[reportInvalidTypeForm]
             httpx: ожидание первого чанка и паузы между чанками).
             0 или отрицательное значение -- без таймаута (ждать бесконечно,
             нужно для очень медленных серверов с долгим prefill).
+        max_context: Реальный лимит контекста (токенов). Если на родителе
+            был обнаружен меньший контекст модели, именно это значение
+            использует воркер для сброса раунда и предупреждения об обрезке.
     """
+    # Лимит контекста: переданный (обнаруженный родителем) либо дефолтный
+    ctx_limit = max_context if max_context else MAX_CONTEXT_TOKENS
+    ctx_warn = int(ctx_limit * 0.85)
     try:
         timeout = model_timeout if model_timeout and model_timeout > 0 else None
         client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=timeout)
@@ -118,7 +126,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
                 prompt_text = f"Поток {worker_id:07d} (раунд {round_num}) продолжай"
 
             # Проверка лимита контекста -- новый раунд
-            if prompt_tokens + total_gen >= MAX_CONTEXT_TOKENS:
+            if prompt_tokens + total_gen >= ctx_limit:
                 # Long context: возвращаемся к диалогу из датасета,
                 # обычный режим: сброс к голому system.
                 messages = list(base_messages)
@@ -132,7 +140,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
 
             # Обрезка истории только в обычном режиме.
             # В long context история -- сам датасет, её не трогаем.
-            if not is_long_context and prompt_tokens + total_gen >= _token_limit_warn():
+            if not is_long_context and prompt_tokens + total_gen >= ctx_warn:
                 messages = truncate_history(messages)
 
             messages.append({"role": "user", "content": prompt_text})
@@ -423,8 +431,7 @@ def run_benchmark(
                       f"{_u.MAX_CONTEXT_TOKENS:,}.")
                 print(f"   Ограничиваю MAX_CONTEXT_TOKENS до {actual_context} "
                       f"(для переопределения вручную: --max-context {actual_context}).")
-                _u.MAX_CONTEXT_TOKENS = actual_context
-                _u.TOKEN_LIMIT_WARN = _u._token_limit_warn()
+                _u.set_max_context(actual_context)
             else:
                 print(f"   Long context: контекст модели {_u.MODEL} = "
                       f"{actual_context:,} токенов.")
@@ -493,7 +500,7 @@ def run_benchmark(
         initial_msgs = long_context_messages[i] if is_lc else None
         p = Process(
             target=worker,
-            args=(i, q, start_event, duration, initial_msgs, skip_errors, is_lc, model_timeout),
+            args=(i, q, start_event, duration, initial_msgs, skip_errors, is_lc, model_timeout, _u.MAX_CONTEXT_TOKENS),
             name=f"worker-{i}",
         )
         p.start()
@@ -526,7 +533,8 @@ def run_benchmark(
                     console.print(f"[red] Воркер {msg_id} остановлен: {msg.get('error', 'unknown')[:100]}[/]")
 
                 live.update(live_table)
-            except Exception:
+            except QueueEmpty:
+                # Ожидаемый таймаут q.get() — просто нет новых сообщений.
                 pass
     except KeyboardInterrupt:
         sigint_handler(None, None)

@@ -15,6 +15,7 @@ import time
 import traceback
 from multiprocessing import Event, Process, Queue
 from pathlib import Path
+from queue import Empty as QueueEmpty
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
@@ -107,7 +108,10 @@ def _worker(  # type: ignore[valid-type]
             if not audio_paths:
                 break
 
-            num_media = min(max_audio, len(audio_paths))
+            # max_audio < 1 сделал бы selected_audio пустым и уронил worker на
+            # selected_audio[0]; гарантируем минимум один файл.
+            safe_max_audio = max(1, max_audio)
+            num_media = min(safe_max_audio, len(audio_paths))
             selected_audio = [
                 audio_paths[(audio_index + i) % len(audio_paths)]
                 for i in range(num_media)
@@ -349,14 +353,13 @@ def run_benchmark(
             if stop_requested:
                 break
 
-            if duration is not None:
-                alive = any(p.is_alive() for p in processes)
-                if not alive:
-                    break
+            # Останавливаемся, когда все воркеры вышли (независимо от duration).
+            if not any(p.is_alive() for p in processes):
+                break
 
             try:
                 msg = q.get(timeout=0.5)
-            except Exception:
+            except QueueEmpty:
                 msg = None
 
             if msg is None:

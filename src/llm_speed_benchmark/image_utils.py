@@ -11,6 +11,7 @@ llm_speed_benchmark/image_utils.py
 from __future__ import annotations
 
 import base64
+import math
 import os
 import random
 import subprocess
@@ -251,10 +252,8 @@ def _gen_rainbow(size: Tuple[int, int], rng: random.Random) -> "Image.Image":
 
 
 def _sin(x: float) -> float:
-    """Простая аппроксимация sin без import math."""
-    # Taylor series: sin(x) ~ x - x^3/6 + x^5/120
-    x = x % (2 * 3.14159)
-    return x - (x ** 3) / 6 + (x ** 5) / 120
+    """Корректный sin (math.sin) для любых углов до полного периода."""
+    return math.sin(x)
 
 
 def load_image_as_base64(image_path: str | Path) -> str:

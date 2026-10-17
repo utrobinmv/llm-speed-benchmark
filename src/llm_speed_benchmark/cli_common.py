@@ -40,7 +40,6 @@ def apply_config(
     Приоритет: CLI > .env
     """
     import llm_speed_benchmark.utils as _u  # noqa: PLC0414
-    from llm_speed_benchmark.utils import _token_limit_warn
 
     if base_url is not None:
         _u.BASE_URL = base_url
@@ -49,5 +48,5 @@ def apply_config(
     if model is not None:
         _u.MODEL = model
     if max_context is not None:
-        _u.MAX_CONTEXT_TOKENS = max_context
-        _u.TOKEN_LIMIT_WARN = _token_limit_warn()
+        # Единый сеттер держит MAX_CONTEXT_TOKENS и TOKEN_LIMIT_WARN в синхроне.
+        _u.set_max_context(max_context)

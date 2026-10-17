@@ -152,14 +152,8 @@ class BaseLiveTable(ABC):
                 return True
             if 0x0E40 <= cp <= 0x0E4E:
                 return True
-            # Emoji and supplementary symbols
+            # Emoji и дополнительные символы: всё от 0x1F000 и выше — wide.
             if cp >= 0x1F000:
-                return True
-            if 0x1F300 <= cp <= 0x1F9FF:
-                return True
-            if 0x1FA00 <= cp <= 0x1FA6F:
-                return True
-            if 0x1FA70 <= cp <= 0x1FAFF:
                 return True
             if 0x2600 <= cp <= 0x26FF:  # Misc Symbols
                 return True
@@ -228,7 +222,12 @@ class BaseLiveTable(ABC):
 
         clean = clean.strip()
         if not clean:
-            return tail
+            # clean оказался пуст только из-за кавычек/разметки — вернём
+            # минимально зачищенный хвост (без управляющих символов и
+            # переводов строк), а не сырой tail с потенциальными \n.
+            return "".join(
+                c for c in tail if c not in "\r\n\x00"
+            ).strip()
 
         # Pass 3: truncate to visual width (counting only visible characters)
         def visual_length(s: str) -> int:
@@ -268,6 +267,14 @@ class BaseLiveTable(ABC):
                 count += 1
                 truncated += ch
             clean = "..." + truncated
+
+            # Rich-разметка: если хвост оборван внутри тега (незакрытый
+            # «[» попал в truncated, а закрывающий «]» остался в обрезанной
+            # части), Rich выкинет исключение на некорректной разметке.
+            # Обрезаем от последнего незакрытого тега, чтобы не ломать table.
+            open_bracket = clean.rfind("[")
+            if open_bracket != -1 and "]" not in clean[open_bracket:]:
+                clean = clean[:open_bracket].rstrip()
 
         return clean
 

@@ -25,6 +25,7 @@ import time
 import traceback
 from multiprocessing import Event, Process, Queue
 from pathlib import Path
+from queue import Empty as QueueEmpty
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
@@ -295,14 +296,14 @@ def _worker(  # type: ignore[valid-type]
                     model=MODEL,
                     input=texts if len(texts) > 1 else texts[0],
                 )
+                if not response.data:
+                    raise ValueError("Empty embeddings response (no data)")
 
                 processing_time = time.time() - processing_start
                 first_chunk_time = processing_time
 
                 # Размерность эмбединга
-                emb_dim = 0
-                if response.data and len(response.data) > 0:
-                    emb_dim = len(response.data[0].embedding)
+                emb_dim = len(response.data[0].embedding)
 
             except Exception as exc:  # noqa: BLE001
                 error_msg = str(exc)
@@ -609,14 +610,17 @@ def run_benchmark(
             if stop_requested:
                 break
 
-            if duration is not None and mode == "cycling":
-                alive = any(p.is_alive() for p in processes)
-                if not alive:
+            # В режиме "cycling" останов по duration / завершению воркеров.
+            # В режиме "once" всегда останавливаемся, когда все воркеры вышли.
+            if mode == "cycling":
+                if duration is not None and not any(p.is_alive() for p in processes):
                     break
+            elif not any(p.is_alive() for p in processes):
+                break
 
             try:
                 msg = q.get(timeout=0.5)
-            except Exception:
+            except QueueEmpty:
                 msg = None
 
             if msg is None:

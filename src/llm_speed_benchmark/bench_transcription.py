@@ -30,6 +30,7 @@ from openai import OpenAI
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table, box as _rich_box
+from queue import Empty as QueueEmpty
 
 from .cli_common import add_common_args, apply_config
 from .transcription_utils import (
@@ -99,7 +100,6 @@ def _worker(  # type: ignore[valid-type]
     total_audio_seconds = 0.0
     total_processing_time = 0.0
     total_ttft = 0.0
-    ttft_count = 0
     task_index = 0
 
     # Mutable refs для live-обновлений
@@ -192,7 +192,10 @@ def _worker(  # type: ignore[valid-type]
 
                 processing_time = time.time() - processing_start
                 token_count = len(transcription_text.split())
-                first_token_time = processing_time  # non-streaming: all at once
+                # Не-стриминговый вызов возвращает весь текст сразу: отдельного
+                # времени первого токена нет, поэтому TTFT не определяем
+                # (не приравниваем к полному времени обработки).
+                first_token_time = None
 
             except Exception as exc:  # noqa: BLE001
                 error_msg = str(exc)
@@ -208,7 +211,7 @@ def _worker(  # type: ignore[valid-type]
                 transcription_text = f"[error] {error_msg[:60]}"
                 processing_time = time.time() - processing_start
                 token_count = 0
-                first_token_time = processing_time
+                first_token_time = None
 
             call_count += 1
             wall_total = time.time() - start_time
@@ -222,7 +225,6 @@ def _worker(  # type: ignore[valid-type]
             total_processing_time += processing_time
             if first_token_time is not None:
                 total_ttft += first_token_time
-                ttft_count += 1
 
             total_tokens_ref[0] = total_tokens
             total_audio_ref[0] = total_audio_seconds
@@ -553,14 +555,17 @@ def run_benchmark(
             if stop_requested:
                 break
 
-            if duration is not None and mode == "cycling":
-                alive = any(p.is_alive() for p in processes)
-                if not alive:
+            # В режиме "cycling" останов по duration / завершению воркеров.
+            # В режиме "once" всегда останавливаемся, когда все воркеры вышли.
+            if mode == "cycling":
+                if duration is not None and not any(p.is_alive() for p in processes):
                     break
+            elif not any(p.is_alive() for p in processes):
+                break
 
             try:
                 msg = q.get(timeout=0.5)
-            except Exception:
+            except QueueEmpty:
                 msg = None
 
             if msg is None:

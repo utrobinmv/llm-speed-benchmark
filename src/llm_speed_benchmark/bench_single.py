@@ -96,14 +96,10 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
             last_tick = time.time()
 
             # === Streaming через StreamSession ===
-            try:
-                metrics = session.run(
-                    messages=messages,
-                    model=_u.MODEL,
-                )
-            except Exception as e:  # noqa: BLE001
-                print(f"\r\033[2KCall {turn:>3} | [red]Ошибка: {e}[/red]")
-                raise
+            metrics = session.run(
+                messages=messages,
+                model=_u.MODEL,
+            )
 
             completion_tokens = metrics.completion_tokens
             prompt_tokens = metrics.prompt_tokens
@@ -140,7 +136,9 @@ def run_benchmark(duration=None, base_url=None, api_key=None, model=None, max_co
             wall_total = time.time() - start_wall
 
             # Защита: если модель ничего не вернула -- пропускаем turn
-            if completion_tokens == 0:
+            # (учитываем и chunk-счётчик: если токены считались только по
+            # чанкам, completion_tokens может быть 0 при реальной генерации).
+            if completion_tokens == 0 and chunk_count == 0:
                 print(f"\r\033[2KCall {turn:>3} | Внимание: пустой ответ, пропускаю...")
                 continue
 
