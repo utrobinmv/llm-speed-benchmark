@@ -41,14 +41,14 @@ def apply_config(
     """
     import llm_speed_benchmark.utils as _u  # noqa: PLC0414
 
-    # Пустая строка (--base-url "") считается "не задано" и НЕ затирает
-    # реальное значение из .env: иначе явная пустая строка молча ломала бы
-    # подключение, заменяя настроенный base_url/api_key/model на "".
-    if base_url:
+    # Пустая/только-пробельная строка (-–base-url " ") считается "не задано"
+    # и НЕ затирает реальное значение из .env: иначе она молча ломала бы
+    # подключение, заменяя настроенный base_url/api_key/model на мусор.
+    if base_url and base_url.strip():
         _u.BASE_URL = base_url
-    if api_key:
+    if api_key and api_key.strip():
         _u.API_KEY = api_key
-    if model:
+    if model and model.strip():
         _u.MODEL = model
     if max_context is not None:
         # Единый сеттер держит MAX_CONTEXT_TOKENS и TOKEN_LIMIT_WARN в синхроне.

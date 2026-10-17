@@ -177,15 +177,18 @@ def worker(  # type: ignore[reportInvalidTypeForm]
                 # после MAX подряд идущих ошибок уходим в error_stop,
                 # чтобы родитель завершил воркер, даже если skip_errors=True.
                 hard_stop = not skip_errors or consecutive_errors >= MAX_CONSECUTIVE_ERRORS
-                q.put({
-                    "type": "error_stop",
-                    "id": worker_id,
-                    "error": str(e),
-                    "calls": call_count,
-                    "wall": format_time(time.time() - start_time),
-                })
                 if hard_stop:
+                    q.put({
+                        "type": "error_stop",
+                        "id": worker_id,
+                        "error": str(e),
+                        "calls": call_count,
+                        "wall": format_time(time.time() - start_time),
+                    })
                     break
+                # Soft-путь (skip_errors=True, лимит ещё не исчерпан):
+                # воркер продолжает работу — НЕ шлём error_stop (иначе родитель
+                # решит, что воркер остановлен, хотя он продолжает слать stats).
                 assistant_content = f"[red]Error: {e}[/]"
 
             if assistant_content and not assistant_content.startswith("[red]Error:"):

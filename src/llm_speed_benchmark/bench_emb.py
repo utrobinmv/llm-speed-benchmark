@@ -309,6 +309,7 @@ def _worker(  # type: ignore[valid-type]
 
                 # Размерность эмбединга
                 emb_dim = len(response.data[0].embedding)
+                consecutive_errors = 0  # успех: сброс счётчика ошибок
 
             except Exception as exc:  # noqa: BLE001
                 error_msg = str(exc)
@@ -328,8 +329,6 @@ def _worker(  # type: ignore[valid-type]
                     break
                 processing_time = time.time() - processing_start
                 emb_dim = 0
-
-            consecutive_errors = 0  # успешная итерация сбрасывает счётчик
 
             call_count += 1
             wall_total = time.time() - start_time

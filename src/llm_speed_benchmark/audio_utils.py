@@ -57,8 +57,10 @@ def get_audio_paths(
     else:
         paths = get_bundled_audio_paths()
 
-    if count and count > 0:
-        paths = paths[:count]
+    if count is not None:
+        # count=0 явно запрашивает пустой список, count>0 — первые N файлов.
+        # (None = без лимита, вернуть все.)
+        paths = paths[:max(count, 0)]
 
     return paths
 

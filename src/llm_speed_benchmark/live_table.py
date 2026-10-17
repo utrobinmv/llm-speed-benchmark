@@ -172,17 +172,38 @@ class BaseLiveTable(ABC):
         # Pass 1: replace wide / non-printable characters, preserve tags
         clean: str = ""
         in_tag = False
-        for c in tail:
+        i = 0
+        n = len(tail)
+        while i < n:
+            c = tail[i]
             if c == "[":
-                in_tag = True
+                # Только если это похоже на валидный Rich-тег ([name...] или
+                # [/name]). Иначе — литеральный символ (LLM-вывод/JSON с []) —
+                # не открываем тег (иначе незакрытая '[' проглотила бы остаток).
+                j = i + 1
+                if j < n and tail[j] == "/":
+                    j += 1
+                name_start = j
+                while j < n and (tail[j].isalnum() or tail[j] in "_-"):
+                    j += 1
+                valid_tag = (j > name_start and j < n and tail[j] == "]")
+                if valid_tag:
+                    in_tag = True
+                    clean += c
+                    i += 1
+                    continue
+                # Литеральная '[' — сохраняем как есть
                 clean += c
+                i += 1
                 continue
             if c == "]" and in_tag:
                 in_tag = False
                 clean += c
+                i += 1
                 continue
             if in_tag:
                 clean += c
+                i += 1
                 continue
             # Outside of tags: replace problematic characters
             if c in "\n\r\t":
@@ -191,6 +212,7 @@ class BaseLiveTable(ABC):
                 clean += c
             else:
                 clean += "."
+            i += 1
 
         # Pass 2: collapse multiple spaces (only outside tags)
         prev: str | None = None

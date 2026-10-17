@@ -43,7 +43,9 @@ def generate_test_images(
     if count < 4:
         count = 4
 
-    random.seed(seed)
+    # Per-item генераторы сеются через independent random.Random(seed + i);
+    # НЕ трогаем глобальный random.seed() — это меняло бы глобальный RNG процесса
+    # и молча влияло бы на несвязанный код.
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -386,7 +388,8 @@ def generate_test_videos(
     if count < 1:
         count = 1
 
-    random.seed(seed)
+    # Per-item генераторы сеются через random.Random(seed + i); глобальный
+    # random.seed() здесь избыточен и лишь засорял бы процесс-глобальный RNG.
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

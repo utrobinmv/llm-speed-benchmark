@@ -102,6 +102,7 @@ class StreamSession:
         assistant_content = ""
         chunk_count = 0
         first_token_time = None
+        usage_seen = False  # пришёл ли от API блок usage (include_usage)
 
         # Для мгновенной скорости: (timestamp, cumulative_chunk)
         instant_buffer: list[tuple[float, int]] = []
@@ -110,6 +111,7 @@ class StreamSession:
 
         for chunk in response:
             if chunk.usage:
+                usage_seen = True
                 prompt_tokens = chunk.usage.prompt_tokens or 0
                 completion_tokens = chunk.usage.completion_tokens or 0
 
@@ -190,8 +192,11 @@ class StreamSession:
         # Call speed
         call_speed = completion_tokens / elapsed if elapsed > 0 and completion_tokens > 0 else 0
 
-        # Fallback: если usage не пришло
-        if completion_tokens == 0:
+        # Fallback: если usage так и не пришло (провайдер игнорирует include_usage) —
+        # и только в этом случае оцениваем completion по числу чанков.
+        # Если usage ВЕРНУЛОСЬ и честно дало 0 токенов (пустая генерация),
+        # то 0 сохраняем: иначе затирали бы легитимный пустой результат.
+        if completion_tokens == 0 and not usage_seen:
             completion_tokens = chunk_count
 
         return StreamMetrics(
