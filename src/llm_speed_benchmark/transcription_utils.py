@@ -7,9 +7,7 @@ llm_speed_benchmark/transcription_utils.py
 
 from __future__ import annotations
 
-import io
 import os
-import struct
 import wave
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple

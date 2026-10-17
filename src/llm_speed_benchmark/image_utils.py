@@ -536,21 +536,28 @@ def _frames_to_mp4(frames: List["Image.Image"], output_path: str, fps: int) -> N
         for i, frame in enumerate(frames):
             frame.save(os.path.join(tmpdir, f"frame_{i:04d}.png"))
 
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-framerate", str(fps),
-                "-i", os.path.join(tmpdir, "frame_%04d.png"),
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-preset", "ultrafast",
-                output_path,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=60,
-        )
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-framerate", str(fps),
+                    "-i", os.path.join(tmpdir, "frame_%04d.png"),
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-preset", "ultrafast",
+                    output_path,
+                ],
+                check=True,
+                capture_output=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError(
+                f"ffmpeg не уложился в 60s при кодировании видео "
+                f"(кадров: {len(frames)}, fps: {fps}). "
+                f"Уменьшите разрешение/число кадров."
+            ) from exc
 
 
 def _ffmpeg_available() -> bool:
