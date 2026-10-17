@@ -8,3 +8,4 @@ build/
 !.env.example
 .venv
 .pytest_cache/
+.venv

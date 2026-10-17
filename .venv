@@ -10,4 +10,4 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     exit 1
 fi
 
-source /home/hermes/workspace/venvs/llm-speed-benchmark/venv/bin/activate
+source /home/joefox/workspace/venvs/llm-speed-benchmark/venv/bin/activate
