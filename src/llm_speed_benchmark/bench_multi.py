@@ -42,6 +42,11 @@ from .live_table import BaseLiveTable
 from .worker_common import make_time_sender, make_on_chunk_callback, send_stats, send_error_stats
 
 
+# Максимум подряд идущих ошибок воркера до принудительного останова
+# (защита от busy-loop, когда skip_errors=True при устойчивом сбое API).
+MAX_CONSECUTIVE_ERRORS = 10
+
+
 def worker(  # type: ignore[reportInvalidTypeForm]
     worker_id: int,
     q: "Queue",
@@ -104,6 +109,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
         round_num = 1
         total_ttft = 0.0
         ttft_count = 0
+        consecutive_errors = 0  # подряд идущие ошибки (защита от busy-loop)
 
         start_event.wait()  # Синхронизация старта
 
@@ -162,8 +168,15 @@ def worker(  # type: ignore[reportInvalidTypeForm]
                 )
 
                 assistant_content = metrics.assistant_content
+                consecutive_errors = 0  # успешный вызов сбрасывает счётчик
 
             except Exception as e:  # noqa: BLE001
+                consecutive_errors += 1
+                # Защита от бесконечного busy-loop при skip_errors=True
+                # под устойчивым сбоем (плохой ключ, модель недоступна):
+                # после MAX подряд идущих ошибок уходим в error_stop,
+                # чтобы родитель завершил воркер, даже если skip_errors=True.
+                hard_stop = not skip_errors or consecutive_errors >= MAX_CONSECUTIVE_ERRORS
                 q.put({
                     "type": "error_stop",
                     "id": worker_id,
@@ -171,7 +184,7 @@ def worker(  # type: ignore[reportInvalidTypeForm]
                     "calls": call_count,
                     "wall": format_time(time.time() - start_time),
                 })
-                if not skip_errors:
+                if hard_stop:
                     break
                 assistant_content = f"[red]Error: {e}[/]"
 

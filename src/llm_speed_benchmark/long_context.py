@@ -118,8 +118,11 @@ def _download_file(url: str, dest: Path, retries: int = 3, timeout: int = 120) -
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 status = r.status
                 content_length = r.headers.get("Content-Length")
-                expected = int(content_length) if content_length else None
-                # 200 = полный файл (начать заново), 206 = partial (докачка)
+                seg_len = int(content_length) if content_length else None
+                # 200 = полный файл (начать заново), 206 = partial (докачка).
+                # Для 206 Content-Length = длина ТОЛЬКО этого сегмента
+                # (оставшиеся байты), а не всего файла — это ключевое отличие
+                # от "полного" размера, поэтому сравниваем сегмент с сегментом.
                 if status == 200:
                     existing = 0
                 mode = "ab" if (status == 206 and existing > 0) else "wb"
@@ -131,18 +134,21 @@ def _download_file(url: str, dest: Path, retries: int = 3, timeout: int = 120) -
                             break
                         f.write(chunk)
                         written += len(chunk)
-                # Если отдано меньше обещанного Content-Length (чистый EOF,
-                # без исключения) — файл битый: НЕ переименовываем, оставляем
-                # .part, чтобы следующий attempt докачал с правильной позиции.
-                if expected is not None and written < expected - existing:
-                    raise OSError(
-                        f"Truncated download: {written + existing} of {expected} bytes"
-                    )
-                if expected is not None and (written + existing) > expected:
-                    raise OSError(
-                        f"Download larger than Content-Length: "
-                        f"{written + existing} vs {expected} bytes"
-                    )
+                # Проверка целостности именно этого сегмента ответа:
+                # - 206: сервер должен отдать ровно запрошенный хвост bytes=existing-
+                #   => written >= seg_len (если seg_len известен).
+                # - 200: полный файл => written == seg_len.
+                if seg_len is not None:
+                    if written < seg_len:
+                        raise OSError(
+                            f"Truncated download segment: got {written} of "
+                            f"{seg_len} bytes (status {status})"
+                        )
+                    if status == 200 and written > seg_len:
+                        raise OSError(
+                            f"Download larger than Content-Length: "
+                            f"{written} vs {seg_len} bytes"
+                        )
             part.rename(dest)
             return
         except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -453,6 +459,20 @@ class LongContextDataset:
         while total_est > max_tokens and len(messages) > 2:
             removed = messages.pop(1)  # Удаляем после system
             total_est -= self._estimate_text_tokens(removed.get("content", ""))
+
+        # Единственное оставшееся сообщение само по себе больше max_tokens:
+        # резать его нельзя (сломается смысл/JSON), поэтому честно сообщаем.
+        # Ранее молча оставляли его — бенчмарк уходил "сверх лимита".
+        if len(messages) == 2 and self._estimate_text_tokens(
+            messages[1].get("content", "")
+        ) > max_tokens:
+            import warnings
+
+            warnings.warn(
+                "single message exceeds max_tokens and cannot be truncated; "
+                "context budget may be slightly exceeded",
+                RuntimeWarning,
+            )
 
         return messages
 

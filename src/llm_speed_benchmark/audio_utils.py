@@ -48,6 +48,11 @@ def get_audio_paths(
         Список Path к аудиофайлам.
     """
     if audio_dir:
+        ap = Path(audio_dir)
+        if not ap.is_dir():
+            raise FileNotFoundError(
+                f"audio_dir не существует или это не директория: {audio_dir}"
+            )
         paths = discover_audio(audio_dir)
     else:
         paths = get_bundled_audio_paths()
@@ -151,10 +156,21 @@ def get_audio_info(audio_path: str | Path) -> dict:
     path = Path(audio_path)
     if path.suffix.lower() == ".wav":
         with wave.open(str(path), "rb") as w:
+            rate = w.getframerate()
+            if rate <= 0:
+                # Некорректный WAV (framerate 0): duration невычислим.
+                # Не делим на 0 — возвращаем duration=None, чтобы вышестоящая
+                # логика (фильтрация по длительности) отнеслась консервативно.
+                return {
+                    "channels": w.getnchannels(),
+                    "sample_rate": rate,
+                    "frames": w.getnframes(),
+                    "duration": None,
+                }
             return {
                 "channels": w.getnchannels(),
-                "sample_rate": w.getframerate(),
+                "sample_rate": rate,
                 "frames": w.getnframes(),
-                "duration": w.getnframes() / w.getframerate(),
+                "duration": w.getnframes() / rate,
             }
     return {"size": path.stat().st_size}

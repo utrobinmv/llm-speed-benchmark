@@ -363,10 +363,6 @@ def _worker(  # type: ignore[valid-type]
                     audio_data = buf.getvalue()
 
                 processing_time = time.time() - processing_start
-                if first_byte_time is None and audio_data:
-                    # Измерить первый байт нельзя (не-потоковое чтение);
-                    # оставляем None, чтобы не выдавать полное время за TTFT.
-                    first_byte_time = None
 
             except Exception as exc:  # noqa: BLE001
                 error_msg = str(exc)
@@ -682,12 +678,12 @@ def run_benchmark(
             if stop_requested:
                 break
 
-            # В режиме "cycling" останов по duration / завершению воркеров.
-            # В режиме "once" всегда останавливаемся, когда все воркеры вышли.
-            if mode == "cycling":
-                if duration is not None and not any(p.is_alive() for p in processes):
-                    break
-            elif not any(p.is_alive() for p in processes):
+            # Остановка, когда все воркеры вышли: корректно для режима
+            # "once" (отработали пул задач) и для "cycling" при краше/всех
+            # error_stop или достижении duration. Без привязки к duration —
+            # иначе при duration=None (default) main loop зависнет на q.get()
+            # после завершения воркеров.
+            if not any(p.is_alive() for p in processes):
                 break
 
             try:
@@ -716,14 +712,15 @@ def run_benchmark(
 
     except KeyboardInterrupt:
         stop_requested = True
-
-    # --- Остановка ---
-    for p in processes:
-        p.terminate()
-    for p in processes:
-        p.join(timeout=3)
-
-    live.stop()
+    finally:
+        # Очистка ВСЕГДА выполняется — не только при KeyboardInterrupt.
+        # Если исключение всплывает из самого event-loop (live.update,
+        # q.get и т.п.), без finally воркеры-дети остались бы висеть.
+        for p in processes:
+            p.terminate()
+        for p in processes:
+            p.join(timeout=3)
+        live.stop()
 
     # --- Итоги ---
     print()

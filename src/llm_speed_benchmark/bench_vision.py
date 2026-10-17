@@ -181,8 +181,6 @@ def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
         start_event.wait()
 
         while duration is None or (time.time() - start_time < duration):
-            wall_total = time.time() - start_time
-            
             selected_images: List[str] = []
             selected_videos: List[str] = []
 
@@ -228,7 +226,6 @@ def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
                     break
                 prompt = prompts[prompt_index % len(prompts)]
                 messages = build_video_message(selected_videos, prompt)
-                current_vid_count = current_vid_count  # already set
 
             else:
                 # image-only mode
@@ -250,6 +247,12 @@ def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
             try:
                 # Обновляем media_count перед вызовом
                 media_count_ref[0] = current_img_count + current_vid_count
+                # Счётчик чанков обнуляем перед каждым запросом, чтобы
+                # live-поток от time-sender отражал только текущий запрос,
+                # независимо от исхода (success или error) — иначе после
+                # ошибки (skip_errors=True) останется устаревший wait.
+                with _state_lock:
+                    _state["chunk_count"] = 0
                 session.on_chunk = _on_chunk
                 session.on_chunk_args = {
                     "start_time": start_time,
@@ -333,7 +336,6 @@ def _worker(  # type: ignore[reportInvalidTypeForm, valid-type]
 
             with _state_lock:
                 _state["total_gen"] = total_gen
-                _state["chunk_count"] = 0
 
             send_mixed_stats(q, worker_id, call_count, metrics,
                                  total_gen=total_gen,

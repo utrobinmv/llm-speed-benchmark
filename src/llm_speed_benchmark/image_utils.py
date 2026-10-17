@@ -530,7 +530,9 @@ def _frames_to_mp4(frames: List["Image.Image"], output_path: str, fps: int) -> N
             "ffmpeg не найден. Установите ffmpeg или укажите свои видео через --videos."
         )
 
-    width, height = frames[0].size
+    if not frames:
+        raise ValueError("_frames_to_mp4: пустой список кадров (frames) — нечего кодировать")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # Сохраняем кадры как PNG
         for i, frame in enumerate(frames):

@@ -159,6 +159,7 @@ def _worker(  # type: ignore[valid-type]
             first_token_time = None
             transcription_text = ""
             token_count = 0
+            call_ok = True  # успех по умолчанию; взводится False на ошибке
 
             try:
                 with open(audio_path, "rb") as f:
@@ -212,6 +213,7 @@ def _worker(  # type: ignore[valid-type]
                 processing_time = time.time() - processing_start
                 token_count = 0
                 first_token_time = None
+                call_ok = False
 
             call_count += 1
             wall_total = time.time() - start_time
@@ -221,7 +223,12 @@ def _worker(  # type: ignore[valid-type]
             rtf = processing_time / audio_dur if audio_dur > 0 else 0
 
             total_tokens += token_count
-            total_audio_seconds += audio_dur
+            # Длительность аудио учитываем только для успешных вызовов:
+            # на ошибке (skip_errors=True) воркер реально не обработал файл,
+            # иначе avg_rtf/audio_speed искажались бы накоплением необработанных
+            # секунд (скос метрик).
+            if call_ok:
+                total_audio_seconds += audio_dur
             total_processing_time += processing_time
             if first_token_time is not None:
                 total_ttft += first_token_time

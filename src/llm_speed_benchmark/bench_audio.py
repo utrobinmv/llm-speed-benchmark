@@ -385,6 +385,35 @@ def run_benchmark(
         stop_requested = True
 
     # --- Остановка ---
+    # Дренируем очередь: финальные stats/error_stop сообщения воркеров могут
+    # ещё лежать в очереди в момент, когда главный цикл вышел по liveness
+    # (событие выхода процесса опережает постановку последнего сообщения).
+    # Без дренажа терялись бы последние значения времени/скоростей в таблице.
+    try:
+        while True:
+            try:
+                msg = q.get(timeout=0.5)
+            except QueueEmpty:
+                msg = None
+            if msg is None:
+                break
+            msg_type = msg.get("type")
+            if msg_type == "start":
+                table.mark_started(msg["id"], msg.get("media", 0))
+            elif msg_type == "stats":
+                table.update_stats(msg)
+            elif msg_type == "live":
+                table.update_live(msg)
+            elif msg_type == "time":
+                table.update_time(msg)
+            elif msg_type == "error":
+                table.mark_error(msg["id"], msg.get("traceback", ""))
+            elif msg_type == "error_stop":
+                table.mark_stopped(msg["id"], msg.get("error", "unknown"))
+            live.update(table.render())
+    except KeyboardInterrupt:
+        pass
+
     for p in processes:
         p.terminate()
     for p in processes:

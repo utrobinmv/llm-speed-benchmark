@@ -157,10 +157,11 @@ class StreamSession:
                             )
                             last_chunk_send = now_chunk
 
-        # Финальный on_chunk: для быстрых ответов (< 0.5s) во время цикла
-        # callback ни разу не сработал из-за троттлинга — сообщаем финальные
-        # значения, чтобы потребители live-прогресса всегда получили данные.
-        if self.on_chunk and chunk_count > 0 and last_chunk_send == 0.0:
+        # Финальный on_chunk: всегда сообщаем терминальное состояние, когда были
+        # чанки. Троттлинг (<0.5s между окнами) может пропустить последний
+        # снапшот, поэтому финальный вызов гарантирует актуальные финальные
+        # значения потребителям live-прогресса (быстрые ответы, конец потока).
+        if self.on_chunk and chunk_count > 0:
             inst_sp_final = self._instant_speed(instant_buffer)
             ttft_final = (
                 round((first_token_time or turn_start) - turn_start, 2)
